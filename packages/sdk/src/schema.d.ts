@@ -6142,6 +6142,7 @@ export interface operations {
                         engineSessionId: string | null;
                         transcriptUri: string | null;
                         sessionStateUri: string | null;
+                        workspaceBaseSha: string | null;
                         error: string | null;
                         /** Format: date-time */
                         queuedAt: string;
@@ -6307,6 +6308,7 @@ export interface operations {
                         engineSessionId: string | null;
                         transcriptUri: string | null;
                         sessionStateUri: string | null;
+                        workspaceBaseSha: string | null;
                         error: string | null;
                         /** Format: date-time */
                         queuedAt: string;
@@ -6571,6 +6573,7 @@ export interface operations {
                         engineSessionId: string | null;
                         transcriptUri: string | null;
                         sessionStateUri: string | null;
+                        workspaceBaseSha: string | null;
                         error: string | null;
                         /** Format: date-time */
                         queuedAt: string;
@@ -6821,6 +6824,7 @@ export interface operations {
                         engineSessionId: string | null;
                         transcriptUri: string | null;
                         sessionStateUri: string | null;
+                        workspaceBaseSha: string | null;
                         error: string | null;
                         /** Format: date-time */
                         queuedAt: string;
@@ -6974,6 +6978,7 @@ export interface operations {
                         engineSessionId: string | null;
                         transcriptUri: string | null;
                         sessionStateUri: string | null;
+                        workspaceBaseSha: string | null;
                         error: string | null;
                         /** Format: date-time */
                         queuedAt: string;
@@ -7125,6 +7130,7 @@ export interface operations {
                         engineSessionId: string | null;
                         transcriptUri: string | null;
                         sessionStateUri: string | null;
+                        workspaceBaseSha: string | null;
                         error: string | null;
                         /** Format: date-time */
                         queuedAt: string;
@@ -7903,6 +7909,7 @@ export interface operations {
                         engineSessionId: string | null;
                         transcriptUri: string | null;
                         sessionStateUri: string | null;
+                        workspaceBaseSha: string | null;
                         error: string | null;
                         /** Format: date-time */
                         queuedAt: string;
@@ -9675,6 +9682,7 @@ export interface operations {
                         engineSessionId: string | null;
                         transcriptUri: string | null;
                         sessionStateUri: string | null;
+                        workspaceBaseSha: string | null;
                         error: string | null;
                         /** Format: date-time */
                         queuedAt: string;

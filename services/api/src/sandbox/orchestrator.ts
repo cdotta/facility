@@ -405,6 +405,7 @@ export async function finishRun(
     git?: {
       branch?: string;
       headSha?: string;
+      baseSha?: string;
       changed: boolean;
       pushError?: string;
       pullRequestTitle?: string;
@@ -475,7 +476,17 @@ export async function finishRun(
   }
   const sandbox = readSandbox(run.sandbox);
   const aggregate = await gatewayAggregate(db, run.id);
-  let receipt = await canonicalRunReceipt(db, run, input.receipt, aggregate, status);
+  // A delivery receipt names the published range. Runs without a delivery
+  // still expose the prepared workspace base they actually inspected.
+  const receiptBaseSha = input.git?.baseSha ?? run.workspaceBaseSha;
+  let receipt = await canonicalRunReceipt(
+    db,
+    run,
+    input.receipt,
+    aggregate,
+    status,
+    receiptBaseSha,
+  );
   const claim = await db.transaction(async (transaction) => {
     const tx = transaction as unknown as ReturnType<typeof createDb>["db"];
     const terminal = (
@@ -586,7 +597,14 @@ export async function finishRun(
       const message = errorMessage(syncError);
       status = "failed";
       error = `security_issue_sync_failed:${message}`;
-      receipt = await canonicalRunReceipt(db, run, input.receipt, aggregate, status);
+      receipt = await canonicalRunReceipt(
+        db,
+        run,
+        input.receipt,
+        aggregate,
+        status,
+        receiptBaseSha,
+      );
       await db
         .update(runs)
         .set({ status, receipt, error, updatedAt: new Date() })
@@ -1674,6 +1692,7 @@ async function prepareRunDelivery(
   git: {
     branch?: string;
     headSha?: string;
+    baseSha?: string;
     changed: boolean;
     pushError?: string;
     pullRequestTitle?: string;
@@ -1751,6 +1770,7 @@ async function prepareRunDelivery(
     repoName: repo.name,
     headBranch: git.branch,
     expectedHeadSha: git.headSha,
+    baseSha: git.baseSha,
     baseBranch: repo.defaultBranch,
     title: git.pullRequestTitle,
     body: pullRequestBody,
@@ -2995,6 +3015,7 @@ async function canonicalRunReceipt(
   runnerReceipt: Record<string, unknown> | undefined,
   aggregate: Awaited<ReturnType<typeof gatewayAggregate>>,
   status: "succeeded" | "failed" | "canceled",
+  baseSha: string | null | undefined,
 ): Promise<FacilityReceipt> {
   const runner = objectOrEmpty(runnerReceipt);
   const runnerTiming = objectOrEmpty(runner.timing);
@@ -3048,6 +3069,7 @@ async function canonicalRunReceipt(
       repo: stringValue(gh.repo),
       issue: integerValue(gh.issueNumber),
       pr: integerValue(objectOrEmpty(gh.pr).number),
+      base_sha: stringValue(baseSha),
     },
     timing: {
       started_at: stringValue(runnerTiming.started_at) ?? startedAt.toISOString(),

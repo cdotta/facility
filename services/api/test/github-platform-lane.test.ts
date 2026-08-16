@@ -3831,6 +3831,7 @@ describe("github platform lane", async () => {
     const run = await insertRun({
       status: "running",
       gh: { owner: repo.owner, repo: repo.name, issueNumber: 91 },
+      workspaceBaseSha: "b".repeat(40),
     });
     const queued: Array<{ queue: string; data: Record<string, unknown> }> = [];
     await finishRun(
@@ -3842,6 +3843,7 @@ describe("github platform lane", async () => {
           changed: true,
           branch: "feature/exact-delivery",
           headSha: "expected-sha",
+          baseSha: "a".repeat(40),
           pullRequestTitle: "fix: bind delivery to the pushed commit",
           pullRequestBody: "Exact delivery",
         },
@@ -3861,7 +3863,12 @@ describe("github platform lane", async () => {
       owner: repo.owner,
       repoName: repo.name,
       expectedHeadSha: "expected-sha",
+      baseSha: "a".repeat(40),
     });
+    const [finishedRun] = await db.select().from(runs).where(eq(runs.id, run.id));
+    expect((finishedRun?.receipt as { github?: { base_sha?: string } })?.github?.base_sha).toBe(
+      "a".repeat(40),
+    );
 
     let createCalls = 0;
     const blocked = await deliverPendingRunDeliveries(db, config, {
@@ -6240,6 +6247,7 @@ describe("github platform lane", async () => {
       trigger?: Record<string, unknown>;
       gh?: Record<string, unknown>;
       sandbox?: Record<string, unknown>;
+      workspaceBaseSha?: string;
     } = {},
   ) {
     const row = (
@@ -6255,6 +6263,7 @@ describe("github platform lane", async () => {
           trigger: input.trigger ?? {},
           sandbox: input.sandbox ?? {},
           gh: input.gh ?? {},
+          workspaceBaseSha: input.workspaceBaseSha,
           createdBy: { type: "user", id: "test" },
         })
         .returning()
