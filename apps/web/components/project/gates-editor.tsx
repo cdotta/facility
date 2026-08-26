@@ -94,7 +94,7 @@ export function GatesEditor({
       </Field>
       <Field
         label="Builder plan gate"
-        hint="Foundation only: required needs recent default-branch fingerprints, platform Builder lanes, #166 base provenance, and a live issue digest. Until that composition lands, it blocks every Builder fail-closed."
+        hint="Required enforces a freshly approved Architect plan, live base and issue freshness, recent default-branch fingerprints, and platform Builder lanes. Plans created before this deployment must be regenerated."
       >
         <Select
           value={planPolicy}

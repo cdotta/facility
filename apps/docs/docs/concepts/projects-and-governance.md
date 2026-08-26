@@ -67,10 +67,10 @@ If the default-branch manifest later removes either platform lane, Facility
 marks the repository fingerprint drifted and rejects the synchronized config;
 restore and verify the governed files before dispatching again.
 Managed pushes mark the fingerprint pending before asynchronous verification,
-and approval rechecks the cached lane plus a recent `ok` fingerprint. This
-foundation is webhook-backed rather than a live GitHub read at every approval;
-the freshness follow-up described below must add that live revalidation before
-`required` becomes operational.
+and approval rechecks the cached lane plus a recent `ok` fingerprint. Approval
+also reads the repository's live default-branch SHA and the live GitHub issue
+revision; a cached mirror or caller-supplied value is never accepted as
+freshness evidence.
 
 Policy activation, run admission, repository mutation, and Builder-relevant
 agent mutations share a per-project transaction lock. Admission also persists
@@ -102,27 +102,32 @@ the approving principal must be a Facility user or the authenticated GitHub
 human who issued the canonical `/builder` command, and must be distinct from
 the proposal opener.
 
-This change is the policy/configuration foundation, not a usable production
-Gate 1 by itself. At this revision, no real dispatch path supplies trusted live
-freshness evidence and the Architect proposal producer does not yet persist the
-workspace-base and canonical issue-revision envelope. Consequently, enabling
-`required` intentionally blocks every Builder attempt with
-`builder_plan_freshness_unavailable`, including an otherwise canonical approval.
-Compose the workspace-base provenance work from #166 with a live, versioned
-GitHub issue digest at both approval and worker dispatch before enabling the
-policy. Proposals created before that coherent deployment are not backfilled:
-run Architect again, approve the new proposal, and do not edit or reuse the old
-one.
+Architect records the checked-out default-branch SHA and a versioned canonical
+digest of the issue title, body, state, author, URL, labels, and material
+comments. Facility excludes its own progress/publication comments and exact
+approval-only Builder comments from that digest. At approval, on worker receipt,
+and once more after the worker atomically claims the run, Facility re-reads the
+live branch and issue. A mismatch returns `builder_plan_stale`; an unavailable
+read returns `builder_plan_freshness_unavailable`, before credentials or a
+sandbox are released. The runner also clones with the approved SHA as its
+expected head, so a later default-branch movement aborts before the model runs.
 
-Architect proposal publication also needs a durable recovery path before this
-policy is enabled. Publication is currently at-least-once: a process failure
-after the GitHub comment is created but before the publication event is stored
-can duplicate the comment, while the normal runner route cannot re-enter a
-terminal Architect run to retry the missing publication. Add an idempotent
-outbox/reconciler or an equivalently durable retry contract before treating
-`required` as operational.
+Proposals created before this coherent deployment are not backfilled. Run
+Architect again, approve the newly published proposal, and do not edit or reuse
+an old plan. The approved plan body and its SHA-256 remain immutable even though
+GitHub cannot atomically lock an issue: an issue edit after the worker's final
+freshness read cannot be excluded atomically, but it cannot rewrite the scope
+that Builder receives.
 
-Two operational follow-ups remain in this foundation. A generic inbound event
+Architect plan publication is a durable, retryable delivery. A scheduled
+reconciler resumes terminal Architect runs whose plan comment was not recorded,
+uses a stable publication marker to discover a comment created during an
+ambiguous response, and closes or suppresses stale publications when their
+proposal is no longer open. GitHub comment creation offers no idempotency key,
+so delivery remains technically at-least-once; the stable marker, bounded retry,
+and reconciler make duplicate publication observable and recoverable.
+
+Two operational follow-ups remain. A generic inbound event
 denied by the gate stays unprocessed, and replaying the same delivery ID does
 not automatically execute it again; an operator must create a fresh delivery
 after correcting the source workflow. Also, the web UI disables Builder trigger
