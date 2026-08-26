@@ -976,6 +976,7 @@ export async function registerGithubV1Routes(app: FastifyInstance, context: V1Ro
             number: githubIssue.number,
             title: githubIssue.title,
             body: githubIssue.body,
+            state: githubIssue.state,
             user: { login: githubIssue.user?.login },
             labels: githubIssue.labels ?? [],
             html_url: githubIssue.html_url,

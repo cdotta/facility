@@ -35,6 +35,7 @@ export type TriggerPayload = {
     number?: number;
     title?: string;
     body?: string | null;
+    state?: string;
     node_id?: string;
     pull_request?: unknown;
     user?: { login?: string };
@@ -344,7 +345,9 @@ export async function routeTrigger(
     // GitHub progress metadata below before enqueueing exactly once. A crash in
     // this window is recovered by the queued-run reconciler.
     if (executableProposal.state !== "executed") {
-      await executeApprovedProposal(db, executableProposal, githubActor);
+      await executeApprovedProposal(db, executableProposal, githubActor, {
+        githubClient: { owner, repo: name, client },
+      });
     }
     const executed = (
       await db
@@ -729,6 +732,9 @@ export function githubRequestContext(
   return {
     title: nullableText(payload.issue?.title),
     body: nullableText(payload.issue?.body),
+    ...(payload.issue?.state === "open" || payload.issue?.state === "closed"
+      ? { state: payload.issue.state }
+      : {}),
     comment: nullableText(payload.comment?.body),
     author: nullableText(payload.issue?.user?.login),
     url: nullableText(payload.issue?.html_url),

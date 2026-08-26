@@ -265,6 +265,11 @@ export async function recordBuilderPlanDenial(
 ): Promise<void> {
   const agentName = (await resolvedAgentIdentity(db, input)).name;
   const trigger = objectValue(input.trigger);
+  const planProvenance = objectValue(trigger.planProvenance);
+  const expectedBaseSha = gitShaValue(planProvenance.workspaceBaseSha);
+  const expectedIssueRevisionSha256 = sha256Value(planProvenance.issueRevisionSha256);
+  const observedBaseSha = gitShaValue(input.freshnessEvidence?.baseSha);
+  const observedIssueRevisionSha256 = sha256Value(input.freshnessEvidence?.issueRevisionSha256);
   await insertAuditEvent(db, {
     orgId: input.orgId,
     projectId: input.projectId,
@@ -282,6 +287,15 @@ export async function recordBuilderPlanDenial(
       agentName: agentName ?? null,
       proposalId: stringValue(trigger.proposalId),
       architectRunId: stringValue(trigger.architectRunId),
+      expectedPlanInputs: {
+        baseSha: expectedBaseSha,
+        issueRevisionSha256: expectedIssueRevisionSha256,
+      },
+      observedPlanInputs: {
+        baseSha: observedBaseSha,
+        issueRevisionSha256: observedIssueRevisionSha256,
+        checkedAt: stringValue(input.freshnessEvidence?.checkedAt),
+      },
     },
   });
 }
@@ -508,6 +522,9 @@ async function validatePlanAcceptance(
   const repoId = stringValue(payload.repoId);
   const issueNumber = positiveInteger(payload.issueNumber);
   const receiptSha256 = sha256Value(payload.receiptSha256);
+  const expectedBaseSha = gitShaValue(payload.workspaceBaseSha);
+  const expectedIssueRevision = sha256Value(payload.issueRevisionSha256);
+  const planProvenance = objectValue(trigger.planProvenance);
   if (
     stringValue(payload.architectRunId) !== architectRun.id ||
     !repoId ||
@@ -515,6 +532,14 @@ async function validatePlanAcceptance(
     !receiptSha256
   ) {
     return invalid("builder_plan_context_invalid", "proposal_context_invalid");
+  }
+  if (
+    expectedBaseSha &&
+    expectedIssueRevision &&
+    (gitShaValue(planProvenance.workspaceBaseSha) !== expectedBaseSha ||
+      sha256Value(planProvenance.issueRevisionSha256) !== expectedIssueRevision)
+  ) {
+    return invalid("builder_plan_context_invalid", "plan_provenance_mismatch");
   }
   const repo = (
     await db
@@ -571,13 +596,13 @@ async function validatePlanAcceptance(
     receipt.data.github?.owner !== repo.owner ||
     receipt.data.github?.repo !== repo.name ||
     receipt.data.github?.issue !== issueNumber ||
+    (expectedBaseSha && receipt.data.github?.base_sha !== expectedBaseSha) ||
+    (expectedBaseSha && gitShaValue(architectRun.workspaceBaseSha) !== expectedBaseSha) ||
     (architectRun.agentDefId && receipt.data.agent_id !== architectRun.agentDefId)
   ) {
     return invalid("builder_plan_context_invalid", "architect_receipt_context_invalid");
   }
 
-  const expectedBaseSha = gitShaValue(payload.workspaceBaseSha);
-  const expectedIssueRevision = sha256Value(payload.issueRevisionSha256);
   const currentBaseSha = gitShaValue(input.freshnessEvidence?.baseSha);
   const currentIssueRevision = sha256Value(input.freshnessEvidence?.issueRevisionSha256);
   const checkedAt = stringValue(input.freshnessEvidence?.checkedAt);

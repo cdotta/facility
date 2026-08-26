@@ -235,7 +235,7 @@ describe("sandbox api", async () => {
           orgId,
           projectId: guardedProject.id,
           agentDefId: agent.id,
-          mode: "conversation",
+          mode: "builder",
           engine: agent.engine,
           trigger: { type: "conversation", message: "bypass attempt" },
           createdBy: { type: "system", id: "worker-policy-test" },

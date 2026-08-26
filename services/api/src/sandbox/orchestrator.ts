@@ -41,7 +41,17 @@ import {
 } from "@facility/db";
 import { isBuilderMode } from "@facility/run-objective";
 import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
-import { assertBuilderPlanDispatch, withBuilderPlanPreflight } from "../builder-plan-policy.js";
+import {
+  type BuilderPlanFreshnessOptions,
+  resolveBuilderPlanFreshnessForRun,
+} from "../builder-plan-freshness.js";
+import {
+  assertBuilderPlanDispatch,
+  builderPlanDenialCode,
+  builderPlanRequired,
+  recordBuilderPlanDenial,
+  withBuilderPlanPreflight,
+} from "../builder-plan-policy.js";
 import { ApiError } from "../errors.js";
 import {
   architectPlanPublicationKey,
@@ -58,6 +68,7 @@ import {
   type GithubClientFactory,
 } from "../github/client.js";
 import { pullRequestBodyForIssue } from "../github/closing-issues.js";
+import { githubIssueRevisionSha256 } from "../github/issue-revision.js";
 import {
   type GithubRunProgressPhase,
   progressCommentId,
@@ -103,6 +114,8 @@ type FinishRunDeps = {
 };
 type DispatchRunDeps = {
   sandboxDriver?: (name: SandboxDriverName) => Promise<SandboxDriver>;
+  githubFactory?: GithubClientFactory;
+  githubClient?: BuilderPlanFreshnessOptions["githubClient"];
 };
 
 type ArchitectPlanPublicationJob = {
@@ -160,9 +173,24 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
   // (failRun revokes by persisted sandbox, which wouldn't yet carry these ids).
   const createdKeys: RunSandboxState = {};
   let launchedSandbox: { driver: SandboxDriver; ref: string } | undefined;
+  let run: RunRow | undefined;
+  let freshnessFailureSource: "worker_initial_freshness" | "worker_claimed_freshness" | null = null;
   try {
-    const run = await loadRun(db, job.orgId, job.runId);
+    run = await loadRun(db, job.orgId, job.runId);
     if (run?.status !== "queued") return;
+    const requiredBuilderPlan =
+      isBuilderMode(run.mode) && (await builderPlanRequired(db, run.orgId, run.projectId));
+    const requiredPlanFreshness =
+      requiredBuilderPlan && objectOrEmpty(run.trigger).source === "plan_acceptance";
+    freshnessFailureSource = requiredPlanFreshness ? "worker_initial_freshness" : null;
+    const initialFreshness = requiredPlanFreshness
+      ? await resolveBuilderPlanFreshnessForRun(db, run, {
+          config,
+          githubFactory: deps.githubFactory,
+          githubClient: deps.githubClient,
+        })
+      : undefined;
+    freshnessFailureSource = null;
     await assertBuilderPlanDispatch(db, {
       orgId: run.orgId,
       projectId: run.projectId,
@@ -173,6 +201,7 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
       runId: run.id,
       actor: { type: "system", id: "runs.dispatch" },
       source: "worker_dispatch",
+      freshnessEvidence: initialFreshness,
     });
     // Claim the run atomically. If a duplicate queue delivery raced us and
     // another worker already moved it out of "queued", the update touches no
@@ -188,6 +217,16 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
     // claiming first prevents another worker racing ahead while this final
     // check fails. The outer failure boundary marks the row failed before any
     // credential or sandbox side effect is created.
+    freshnessFailureSource = requiredPlanFreshness ? "worker_claimed_freshness" : null;
+    const claimedFreshness = requiredPlanFreshness
+      ? await resolveBuilderPlanFreshnessForRun(db, run, {
+          config,
+          githubFactory: deps.githubFactory,
+          githubClient: deps.githubClient,
+        })
+      : undefined;
+    freshnessFailureSource = null;
+    const claimedRunScope = { orgId: run.orgId, runId: run.id };
     const dispatchSnapshot = await withBuilderPlanPreflight(
       db,
       {
@@ -200,9 +239,10 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
         runId: run.id,
         actor: { type: "system", id: "runs.dispatch" },
         source: "worker_claimed_dispatch",
+        freshnessEvidence: claimedFreshness,
       },
       async (tx, admission) => {
-        let claimedRun = await loadRun(tx, run.orgId, run.id);
+        let claimedRun = await loadRun(tx, claimedRunScope.orgId, claimedRunScope.runId);
         if (claimedRun?.status !== "provisioning") return null;
         if (claimedRun.mode !== admission.mode) {
           const sealed = (
@@ -222,6 +262,19 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
       },
     );
     if (!dispatchSnapshot) return;
+    if (claimedFreshness) {
+      await appendRunEvents(db, run.orgId, run.id, [
+        {
+          type: "builder_plan_admitted",
+          data: {
+            proposalId: stringValue(objectOrEmpty(run.trigger).proposalId),
+            baseSha: claimedFreshness.baseSha,
+            issueRevisionSha256: claimedFreshness.issueRevisionSha256,
+            checkedAt: claimedFreshness.checkedAt,
+          },
+        },
+      ]);
+    }
     await appendRunEvents(db, run.orgId, run.id, [{ type: "provisioning", data: {} }]);
 
     const { bundle, profile, agentPermissions } = dispatchSnapshot;
@@ -372,8 +425,26 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
     ]);
     await updateGithubRunProgress(db, run.id, "provisioning", { config }).catch(() => undefined);
   } catch (error) {
-    const builderPlanCode =
-      error instanceof ApiError && error.code.startsWith("builder_plan_") ? error.code : null;
+    const builderPlanCode = error instanceof ApiError ? builderPlanDenialCode(error.code) : null;
+    if (builderPlanCode && freshnessFailureSource && run) {
+      await recordBuilderPlanDenial(
+        db,
+        {
+          orgId: run.orgId,
+          projectId: run.projectId,
+          mode: run.mode,
+          agentDefId: run.agentDefId,
+          trigger: run.trigger,
+          gh: run.gh,
+          runId: run.id,
+          actor: { type: "system", id: "runs.dispatch" },
+          source: freshnessFailureSource,
+        },
+        builderPlanCode,
+        stringValue(objectOrEmpty(error instanceof ApiError ? error.details : null).reason) ??
+          "freshness_resolution_failed",
+      ).catch(() => undefined);
+    }
     await failRun(
       db,
       job.orgId,
@@ -872,12 +943,17 @@ async function ensureArchitectPlanAcceptance(
       .limit(1)
   )[0];
   if (!actionType) throw new Error("plan_acceptance_action_missing");
+  const runTrigger = objectOrEmpty(run.trigger);
+  const workspaceBaseSha = gitCommitSha(run.workspaceBaseSha);
+  const issueRevisionSha256 = githubIssueRevisionSha256(runTrigger.request);
   const canonicalPayload = {
     architectRunId: run.id,
     issueNumber,
     repoId: repo.id,
     receiptSha256: receipt.integrity?.payload_sha256,
     planSha256: createHash("sha256").update(plan).digest("hex"),
+    ...(workspaceBaseSha ? { workspaceBaseSha } : {}),
+    ...(issueRevisionSha256 ? { issueRevisionSha256 } : {}),
   };
   await db.execute(
     sql`select pg_advisory_xact_lock(hashtextextended(${`architect-plan:${run.id}`}, 0))`,
@@ -901,7 +977,9 @@ async function ensureArchitectPlanAcceptance(
       payload.issueNumber !== canonicalPayload.issueNumber ||
       payload.repoId !== canonicalPayload.repoId ||
       payload.receiptSha256 !== canonicalPayload.receiptSha256 ||
-      payload.planSha256 !== canonicalPayload.planSha256
+      payload.planSha256 !== canonicalPayload.planSha256 ||
+      (gitCommitSha(payload.workspaceBaseSha) ?? null) !== (workspaceBaseSha ?? null) ||
+      (sha256Digest(payload.issueRevisionSha256) ?? null) !== (issueRevisionSha256 ?? null)
     ) {
       continue;
     }
@@ -1179,6 +1257,10 @@ async function publishArchitectPlanAcceptance(
       !repoId ||
       payload.architectRunId !== run.id ||
       payload.planSha256 !== createHash("sha256").update(proposal.contextMd).digest("hex") ||
+      (gitCommitSha(payload.workspaceBaseSha) ?? null) !==
+        (gitCommitSha(run.workspaceBaseSha) ?? null) ||
+      (sha256Digest(payload.issueRevisionSha256) ?? null) !==
+        (githubIssueRevisionSha256(objectOrEmpty(run.trigger).request) ?? null) ||
       !receipt.success ||
       !verifyFacilityReceipt(receipt.data) ||
       payload.receiptSha256 !== receipt.data.integrity?.payload_sha256
@@ -2535,7 +2617,11 @@ async function buildRunBundle(
   const contract = renderRunContract(rawContract, provisionSummary, checkCmds);
   const githubBranch = typeof runGh.branch === "string" ? runGh.branch : null;
   const checkoutBranch = githubPullRequestMode(run.mode) && githubBranch ? githubBranch : null;
-  const expectedHeadSha = repairExpectedHeadSha(run.mode, run.trigger);
+  const planProvenance = objectOrEmpty(objectOrEmpty(run.trigger).planProvenance);
+  const acceptedPlanBaseSha = isBuilderMode(run.mode)
+    ? gitCommitSha(planProvenance.workspaceBaseSha)
+    : undefined;
+  const expectedHeadSha = repairExpectedHeadSha(run.mode, run.trigger) ?? acceptedPlanBaseSha;
   if (run.mode.replace(/^codex-/, "").replace(/-/g, "_") === "ci_doctor" && !expectedHeadSha) {
     throw new Error("ci_doctor_admitted_head_missing");
   }
@@ -2571,7 +2657,7 @@ async function buildRunBundle(
       ? {
           cloneUrl: `https://github.com/${repo.owner}/${repo.name}.git`,
           branch: checkoutBranch ?? repo.defaultBranch,
-          expectedHeadSha,
+          expectedHeadSha: expectedHeadSha ?? null,
           installationTokenRef: repo.installationId,
         }
       : { cloneUrl: null, branch: null, expectedHeadSha: null, installationTokenRef: null },
@@ -3203,6 +3289,18 @@ function receiptMode(mode: string): FacilityReceipt["mode"] {
 
 function stringValue(value: unknown) {
   return typeof value === "string" && value ? value : undefined;
+}
+
+function gitCommitSha(value: unknown) {
+  return typeof value === "string" && /^[a-f0-9]{40}$/i.test(value)
+    ? value.toLowerCase()
+    : undefined;
+}
+
+function sha256Digest(value: unknown) {
+  return typeof value === "string" && /^[a-f0-9]{64}$/i.test(value)
+    ? value.toLowerCase()
+    : undefined;
 }
 
 function integerValue(value: unknown) {

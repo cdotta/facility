@@ -25,8 +25,11 @@ import {
   withBuilderPlanPreflight,
 } from "../src/builder-plan-policy.js";
 import { ApiError } from "../src/errors.js";
+import { githubIssueRevisionSha256 } from "../src/github/issue-revision.js";
 import { syncRepoFacilityConfig } from "../src/github/kickstart.js";
 import { routeTrigger, type TriggerPayload } from "../src/github/router.js";
+import { dispatchRun } from "../src/sandbox/orchestrator.js";
+import type { AppConfig } from "../src/types.js";
 
 const databaseUrl =
   process.env.DATABASE_URL ?? "postgres://facility:facility@127.0.0.1:5461/facility_test";
@@ -355,6 +358,18 @@ describe("builder plan policy integration", async () => {
 
   it("routes GitHub /builder through the canonical executor and ignores a poisoned proposalId", async () => {
     const fixture = await githubRouteFixture("open");
+    await db
+      .update(projects)
+      .set({ builderPlanPolicy: "required" })
+      .where(eq(projects.id, fixture.projectId));
+    await db
+      .update(repos)
+      .set({
+        fingerprint: { files: [] },
+        fingerprintStatus: "ok",
+        fingerprintVerifiedAt: new Date(),
+      })
+      .where(eq(repos.projectId, fixture.projectId));
     const poisonId = newId("run");
     await db.insert(runs).values({
       id: poisonId,
@@ -380,7 +395,31 @@ describe("builder plan policy integration", async () => {
       deliveryId,
     );
 
-    expect(result.routed).toBe(true);
+    const denial = (
+      await db
+        .select({ payload: auditEvents.payload })
+        .from(auditEvents)
+        .where(
+          and(
+            eq(auditEvents.orgId, fixture.orgId),
+            eq(auditEvents.action, "run.builder_plan_denied"),
+          ),
+        )
+        .orderBy(desc(auditEvents.seq))
+        .limit(1)
+    )[0];
+    const execution = (
+      await db
+        .select({ data: proposalEvents.data })
+        .from(proposalEvents)
+        .where(eq(proposalEvents.proposalId, fixture.proposalId))
+        .orderBy(desc(proposalEvents.seq))
+        .limit(1)
+    )[0];
+    expect(
+      result.routed,
+      JSON.stringify({ result, denial: denial?.payload, execution: execution?.data }),
+    ).toBe(true);
     expect(result.runId).not.toBe(poisonId);
     const canonical = (
       await db
@@ -430,6 +469,188 @@ describe("builder plan policy integration", async () => {
         .where(and(eq(auditEvents.orgId, fixture.orgId), eq(auditEvents.action, "hitl.decided")))
     ).filter((event) => (event.target as { id?: unknown }).id === fixture.proposalId);
     expect(decisions).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      name: "default branch",
+      drift: (fixture: Awaited<ReturnType<typeof githubRouteFixture>>) => {
+        fixture.live.baseSha = "b".repeat(40);
+      },
+    },
+    {
+      name: "issue scope",
+      drift: (fixture: Awaited<ReturnType<typeof githubRouteFixture>>) => {
+        fixture.live.issueBody = "Implement it, plus a newly-added requirement.";
+      },
+    },
+  ])("rejects a required GitHub approval when the live $name changed", async ({ drift }) => {
+    const fixture = await githubRouteFixture("open");
+    await db
+      .update(projects)
+      .set({ builderPlanPolicy: "required" })
+      .where(eq(projects.id, fixture.projectId));
+    await db
+      .update(repos)
+      .set({
+        fingerprint: { files: [] },
+        fingerprintStatus: "ok",
+        fingerprintVerifiedAt: new Date(),
+      })
+      .where(eq(repos.projectId, fixture.projectId));
+    drift(fixture);
+    const before = await projectRuns(fixture.orgId, fixture.projectId);
+
+    const result = await routeTrigger(db, fixture.orgId, fixture.client, fixture.payload);
+
+    expect(result).toMatchObject({ routed: false, reason: "builder_plan_stale" });
+    expect(await projectRuns(fixture.orgId, fixture.projectId)).toHaveLength(before.length);
+    await expect(lastDenialCode(fixture.orgId)).resolves.toBe("builder_plan_stale");
+    const denial = await lastDenialPayload(fixture.orgId);
+    const provenance = fixture.dispatch.trigger.planProvenance as Record<string, unknown>;
+    const expected = {
+      baseSha: provenance.workspaceBaseSha,
+      issueRevisionSha256: provenance.issueRevisionSha256,
+    };
+    const observed = denial.observedPlanInputs as Record<string, unknown>;
+    expect(denial).toMatchObject({
+      code: "builder_plan_stale",
+      expectedPlanInputs: expected,
+      observedPlanInputs: { checkedAt: expect.any(String) },
+    });
+    expect({
+      baseSha: observed.baseSha,
+      issueRevisionSha256: observed.issueRevisionSha256,
+    }).not.toEqual(expected);
+  });
+
+  it("fails closed and audits a required approval when GitHub freshness is unavailable", async () => {
+    const fixture = await githubRouteFixture("open");
+    await db
+      .update(projects)
+      .set({ builderPlanPolicy: "required" })
+      .where(eq(projects.id, fixture.projectId));
+    await db
+      .update(repos)
+      .set({
+        fingerprint: { files: [] },
+        fingerprintStatus: "ok",
+        fingerprintVerifiedAt: new Date(),
+      })
+      .where(eq(repos.projectId, fixture.projectId));
+    fixture.live.issueError = new Error("GitHub fixture unavailable");
+    const before = await projectRuns(fixture.orgId, fixture.projectId);
+
+    const result = await routeTrigger(db, fixture.orgId, fixture.client, fixture.payload);
+
+    expect(result).toMatchObject({
+      routed: false,
+      reason: "builder_plan_freshness_unavailable",
+    });
+    expect(await projectRuns(fixture.orgId, fixture.projectId)).toHaveLength(before.length);
+    await expect(lastDenialCode(fixture.orgId)).resolves.toBe("builder_plan_freshness_unavailable");
+  });
+
+  it.each([
+    {
+      name: "issue drift",
+      expected: "builder_plan_stale",
+      secondIssueBody: "Implement it, plus a requirement added during worker claim.",
+      secondIssueError: null,
+    },
+    {
+      name: "GitHub freshness outage",
+      expected: "builder_plan_freshness_unavailable",
+      secondIssueBody: null,
+      secondIssueError: "GitHub fixture unavailable during worker claim",
+    },
+  ])("revalidates a required plan after the worker claim and launches no sandbox on $name", async ({
+    expected,
+    secondIssueBody,
+    secondIssueError,
+  }) => {
+    const fixture = await githubRouteFixture("open");
+    await db
+      .update(projects)
+      .set({ builderPlanPolicy: "required" })
+      .where(eq(projects.id, fixture.projectId));
+    await db
+      .update(repos)
+      .set({
+        fingerprint: { files: [] },
+        fingerprintStatus: "ok",
+        fingerprintVerifiedAt: new Date(),
+      })
+      .where(eq(repos.projectId, fixture.projectId));
+    const routed = await routeTrigger(db, fixture.orgId, fixture.client, fixture.payload);
+    expect(routed).toMatchObject({ routed: true });
+    if (!routed.runId) throw new Error("required Builder run was not created");
+
+    const repository = fixture.payload.repository;
+    const owner = repository?.owner?.login;
+    const repo = repository?.name;
+    if (!owner || !repo) throw new Error("worker freshness repository fixture missing");
+    let issueReads = 0;
+    let launches = 0;
+    const workerClient = {
+      getDefaultBranchSha: async () => fixture.live.baseSha,
+      getIssue: async () => {
+        issueReads += 1;
+        if (issueReads === 2 && secondIssueError) throw new Error(secondIssueError);
+        return {
+          number: 204,
+          title: "Require a plan",
+          body: issueReads === 1 ? "Implement it" : secondIssueBody,
+          state: "open",
+          user: { login: "requester" },
+          labels: [],
+          html_url: `https://github.test/${owner}/${repo}/issues/204`,
+        };
+      },
+      listIssueComments: async () => [
+        {
+          id: 204,
+          author: "maintainer",
+          authorType: "User",
+          body: "/builder",
+          createdAt: "2026-08-26T10:00:00Z",
+          url: "https://github.test/comments/204",
+        },
+      ],
+    };
+
+    await expect(
+      dispatchRun(
+        { databaseUrl } as AppConfig,
+        { runId: routed.runId, orgId: fixture.orgId },
+        {
+          githubClient: { owner, repo, client: workerClient },
+          sandboxDriver: async () => {
+            launches += 1;
+            return {
+              name: "docker",
+              launch: async () => ({ ref: "must-not-launch" }),
+              status: async () => "running",
+              async *logs() {},
+              stop: async () => undefined,
+              destroy: async () => undefined,
+            } as never;
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: expected });
+    expect(issueReads).toBe(2);
+    expect(launches).toBe(0);
+    expect(
+      (
+        await db
+          .select({ status: runs.status, error: runs.error })
+          .from(runs)
+          .where(eq(runs.id, routed.runId))
+          .limit(1)
+      )[0],
+    ).toEqual({ status: "failed", error: expected });
+    await expect(lastDenialCode(fixture.orgId)).resolves.toBe(expected);
   });
 
   it("recovers an executing GitHub plan and a crash after the exact row was created", async () => {
@@ -718,11 +939,19 @@ describe("builder plan policy integration", async () => {
     const architectRunId = `run_arch_${suffix}`;
     const proposalId = `prop_plan_${suffix}`;
     const actionTypeId = `act_plan_${suffix}`;
-    const issueUpdatedAt = new Date().toISOString();
-    const issueRevisionSha256 = createHash("sha256")
-      .update(`issue:204:${issueUpdatedAt}`)
-      .digest("hex");
     const baseSha = "a".repeat(40);
+    const issueUrl = `https://github.test/facility-test/plan-${suffix}/issues/204`;
+    const issueRequest = {
+      title: "Require a plan",
+      body: "Implement it",
+      state: "open",
+      author: "requester",
+      url: issueUrl,
+      labels: [],
+      comments: [],
+    };
+    const issueRevisionSha256 = githubIssueRevisionSha256(issueRequest);
+    if (!issueRevisionSha256) throw new Error("issue revision fixture missing");
     const plan = "Implement the reviewed change and run the named checks.";
     const planSha256 = createHash("sha256").update(plan).digest("hex");
     const decidedAt = new Date();
@@ -751,8 +980,8 @@ describe("builder plan policy integration", async () => {
       number: 204,
       title: "Require a plan",
       state: "open",
-      htmlUrl: `https://github.test/facility-test/plan-${suffix}/issues/204`,
-      ghUpdatedAt: new Date(issueUpdatedAt),
+      htmlUrl: issueUrl,
+      ghUpdatedAt: new Date(),
     });
     const receipt = sealFacilityReceipt(
       {
@@ -777,7 +1006,12 @@ describe("builder plan policy integration", async () => {
           tool_calls: 1,
           errors: 0,
         },
-        github: { owner: "facility-test", repo: `plan-${suffix}`, issue: 204 },
+        github: {
+          owner: "facility-test",
+          repo: `plan-${suffix}`,
+          issue: 204,
+          base_sha: baseSha,
+        },
         timing: { started_at: decidedAt.toISOString(), ended_at: decidedAt.toISOString() },
       },
       null,
@@ -798,7 +1032,9 @@ describe("builder plan policy integration", async () => {
           baseSha,
         },
         issue: { number: 204 },
+        request: issueRequest,
       },
+      workspaceBaseSha: baseSha,
       receipt,
       gh: { owner: "facility-test", repo: `plan-${suffix}`, issueNumber: 204 },
       createdBy: { type: "user", id: "requester" },
@@ -866,6 +1102,7 @@ describe("builder plan policy integration", async () => {
           approvedPlan: plan,
           planSha256,
           approval: { principal: "approver", at: decidedAt.toISOString() },
+          planProvenance: { workspaceBaseSha: baseSha, issueRevisionSha256 },
         },
         gh: { owner: "facility-test", repo: `plan-${suffix}`, issueNumber: 204 },
         actor: { type: "user", id: "approver" },
@@ -948,6 +1185,10 @@ describe("builder plan policy integration", async () => {
       ],
     });
     let nextCommentId = 1;
+    const live: { baseSha: string; issueBody: string; issueError?: Error } = {
+      baseSha: fixture.dispatch.freshnessEvidence.baseSha,
+      issueBody: "Implement it",
+    };
     const client = {
       userCanWrite: async () => true,
       getContent: async () => ({
@@ -959,7 +1200,29 @@ describe("builder plan policy integration", async () => {
           }),
         ).toString("base64"),
       }),
-      listIssueComments: async () => [],
+      listIssueComments: async () => [
+        {
+          id: 204,
+          author: "maintainer",
+          authorType: "User",
+          body: "/builder",
+          createdAt: "2026-08-26T10:00:00Z",
+          url: "https://github.test/comments/204",
+        },
+      ],
+      getDefaultBranchSha: async () => live.baseSha,
+      getIssue: async () => {
+        if (live.issueError) throw live.issueError;
+        return {
+          number: 204,
+          title: "Require a plan",
+          body: live.issueBody,
+          state: "open",
+          user: { login: "requester" },
+          labels: [],
+          html_url: `https://github.test/${repo.owner}/${repo.name}/issues/204`,
+        };
+      },
       assignIssue: async () => true,
       createIssueComment: async () => ({ id: nextCommentId++ }),
     } as never;
@@ -982,6 +1245,7 @@ describe("builder plan policy integration", async () => {
       architectRunId: String(fixture.dispatch.trigger.architectRunId),
       builderAgentId,
       client,
+      live,
       payload,
     };
   }
@@ -994,6 +1258,10 @@ describe("builder plan policy integration", async () => {
   }
 
   async function lastDenialCode(orgId: string) {
+    return (await lastDenialPayload(orgId)).code;
+  }
+
+  async function lastDenialPayload(orgId: string): Promise<Record<string, unknown>> {
     const row = (
       await db
         .select({ payload: auditEvents.payload })
@@ -1002,6 +1270,6 @@ describe("builder plan policy integration", async () => {
         .orderBy(desc(auditEvents.seq))
         .limit(1)
     )[0];
-    return (row?.payload as { code?: unknown } | undefined)?.code;
+    return (row?.payload as Record<string, unknown> | undefined) ?? {};
   }
 });

@@ -35,6 +35,7 @@ import { buildApp } from "../src/app.js";
 import { executeApprovedProposal } from "../src/executors.js";
 import type { GithubClientFactory, Octokit } from "../src/github/client.js";
 import { pullRequestBodyForIssue } from "../src/github/closing-issues.js";
+import { githubIssueRevisionSha256 } from "../src/github/issue-revision.js";
 import { syncRepoIssues, upsertGhIssueFromWebhook } from "../src/github/issues-sync.js";
 import {
   enqueueGithubIssuesSync,
@@ -4713,9 +4714,26 @@ describe("github platform lane", async () => {
 
   it("finishRun publishes an architect plan and opens the human Gate 1 proposal", async () => {
     const repo = await insertRepoWithInstallation(`plan-${Date.now()}`);
+    const workspaceBaseSha = "d".repeat(40);
+    const issueRequest = {
+      title: "Preserve Architect publication marker",
+      body: "Publish one immutable plan.",
+      state: "open",
+      author: "maintainer",
+      url: `https://github.test/${repo.owner}/${repo.name}/issues/71`,
+      labels: ["governance"],
+      comments: [],
+    };
     const run = await insertRun({
       mode: "architect",
       status: "running",
+      workspaceBaseSha,
+      trigger: {
+        type: "github_comment",
+        repo: { id: repo.id, owner: repo.owner, name: repo.name },
+        issue: { number: 71 },
+        request: issueRequest,
+      },
       gh: {
         owner: repo.owner,
         repo: repo.name,
@@ -4793,7 +4811,12 @@ describe("github platform lane", async () => {
     expect(comments.at(-1)).toContain("<!-- facility:architect-plan:");
     const [proposal] = await db.select().from(proposals).where(eq(proposals.runId, run.id));
     expect(proposal?.state).toBe("open");
-    expect(proposal?.payload).toMatchObject({ issueNumber: 71, repoId: repo.id });
+    expect(proposal?.payload).toMatchObject({
+      issueNumber: 71,
+      repoId: repo.id,
+      workspaceBaseSha,
+      issueRevisionSha256: githubIssueRevisionSha256(issueRequest),
+    });
   });
 
   it("keeps a sealed Architect success durable and retries transient plan publication", async () => {

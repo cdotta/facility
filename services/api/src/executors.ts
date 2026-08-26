@@ -36,7 +36,12 @@ import { artifactIdFor, validate } from "@facility/harness";
 import { and, desc, eq, gt, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import { assertBudgetAgentInProject, resolveBudgetScope } from "./budget-scope.js";
 import {
+  type BuilderPlanFreshnessOptions,
+  resolveBuilderPlanFreshnessForProposal,
+} from "./builder-plan-freshness.js";
+import {
   architectRunIdentityValid,
+  builderPlanDenialCode,
   builderPlanRequired,
   lockBuilderPlanPolicy,
   recordBuilderPlanDenial,
@@ -93,6 +98,7 @@ type ExecuteApprovedProposalOptions = {
   config?: AppConfig;
   github?: GitHubIssueClient;
   githubFactory?: GithubClientFactory;
+  githubClient?: BuilderPlanFreshnessOptions["githubClient"];
   enqueue?: (queue: string, data: Record<string, unknown>) => Promise<string | null>;
 };
 
@@ -276,6 +282,45 @@ async function executePlanAcceptance(
 
   const builderCommand = architectRun.engine === "codex" ? "codex-builder" : "builder";
   await assertPlatformBuilderLane(db, proposal, architectRun, builderCommand);
+  const requiredPlan = await builderPlanRequired(db, proposal.orgId, proposal.projectId);
+  let freshnessEvidence:
+    | Awaited<ReturnType<typeof resolveBuilderPlanFreshnessForProposal>>
+    | undefined;
+  if (requiredPlan) {
+    try {
+      freshnessEvidence = await resolveBuilderPlanFreshnessForProposal(db, proposal, options);
+    } catch (error) {
+      const apiError = error instanceof ApiError ? error : null;
+      const code = apiError ? builderPlanDenialCode(apiError.code) : null;
+      if (code) {
+        const payload = objectOrEmpty(proposal.payload);
+        await recordBuilderPlanDenial(
+          db,
+          {
+            orgId: proposal.orgId,
+            projectId: proposal.projectId,
+            mode: builderCommand,
+            agentName: builderCommand,
+            trigger: {
+              source: "plan_acceptance",
+              proposalId: proposal.id,
+              architectRunId: architectRun.id,
+              planProvenance: {
+                workspaceBaseSha: payload.workspaceBaseSha,
+                issueRevisionSha256: payload.issueRevisionSha256,
+              },
+            },
+            gh: architectRun.gh,
+            actor: { type: auditActorType(actor.type), id: actor.id },
+            source: "plan_acceptance_freshness",
+          },
+          code,
+          stringField(objectOrEmpty(apiError?.details).reason) ?? "freshness_resolution_failed",
+        );
+      }
+      throw error;
+    }
+  }
 
   const builderGh = { ...objectOrEmpty(architectRun.gh) };
   delete builderGh.progressComment;
@@ -321,6 +366,7 @@ async function executePlanAcceptance(
         runId: existingRun.id,
         actor: { type: auditActorType(actor.type), id: actor.id },
         source: "plan_acceptance_retry",
+        freshnessEvidence,
       },
       async (tx) => {
         await assertPlatformBuilderLane(tx, proposal, architectRun, builderCommand);
@@ -352,6 +398,7 @@ async function executePlanAcceptance(
   if (!builder) throw new Error("plan_acceptance_builder_not_configured");
 
   const architectTrigger = objectOrEmpty(architectRun.trigger);
+  const proposalPayload = objectOrEmpty(proposal.payload);
   const architectCreator = objectOrEmpty(architectRun.createdBy);
   const githubLogin =
     stringField(architectTrigger.githubLogin) ??
@@ -367,6 +414,11 @@ async function executePlanAcceptance(
     approvedPlan: proposal.contextMd,
     planSha256,
     approval,
+    planProvenance: {
+      workspaceBaseSha: proposalPayload.workspaceBaseSha,
+      issueRevisionSha256: proposalPayload.issueRevisionSha256,
+    },
+    ...(freshnessEvidence ? { admissionFreshness: freshnessEvidence } : {}),
   };
   const builderPolicyInput = {
     orgId: proposal.orgId,
@@ -377,6 +429,7 @@ async function executePlanAcceptance(
     gh: builderGh,
     actor: { type: auditActorType(actor.type), id: actor.id } as const,
     source: "plan_acceptance_executor",
+    freshnessEvidence,
   };
 
   const createdRun = await withBuilderPlanPreflight(
