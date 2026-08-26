@@ -114,6 +114,14 @@ policy. Proposals created before that coherent deployment are not backfilled:
 run Architect again, approve the new proposal, and do not edit or reuse the old
 one.
 
+Architect proposal publication also needs a durable recovery path before this
+policy is enabled. Publication is currently at-least-once: a process failure
+after the GitHub comment is created but before the publication event is stored
+can duplicate the comment, while the normal runner route cannot re-enter a
+terminal Architect run to retry the missing publication. Add an idempotent
+outbox/reconciler or an equivalently durable retry contract before treating
+`required` as operational.
+
 Two operational follow-ups remain in this foundation. A generic inbound event
 denied by the gate stays unprocessed, and replaying the same delivery ID does
 not automatically execute it again; an operator must create a fresh delivery
