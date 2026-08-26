@@ -188,51 +188,57 @@ export async function executeApprovedProposal(
     } else {
       throw new Error(`unsupported_action_type:${actionType.name}`);
     }
-    const completed = (
-      await db
-        .update(proposals)
-        .set({ state: "executed", updatedAt: new Date() })
-        .where(
-          and(
-            eq(proposals.orgId, proposal.orgId),
-            eq(proposals.id, proposal.id),
-            inArray(proposals.state, ["executing", "execution_failed"]),
-          ),
-        )
-        .returning()
-    )[0];
-    if (completed) {
-      await appendProposalEvent(db, proposal, "executed", actor, {
-        actionType: actionType.name,
-        ...(recurrence ? { recurrence } : {}),
-      });
-    }
+    await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      const completed = (
+        await tx
+          .update(proposals)
+          .set({ state: "executed", updatedAt: new Date() })
+          .where(
+            and(
+              eq(proposals.orgId, proposal.orgId),
+              eq(proposals.id, proposal.id),
+              inArray(proposals.state, ["executing", "execution_failed"]),
+            ),
+          )
+          .returning()
+      )[0];
+      if (completed) {
+        await appendProposalEvent(tx, completed, "executed", actor, {
+          actionType: actionType.name,
+          ...(recurrence ? { recurrence } : {}),
+        });
+      }
+    });
     return true;
   } catch (error) {
-    const failed = (
-      await db
-        .update(proposals)
-        .set({ state: "execution_failed", updatedAt: new Date() })
-        .where(
-          and(
-            eq(proposals.orgId, proposal.orgId),
-            eq(proposals.id, proposal.id),
-            eq(proposals.state, "executing"),
-          ),
-        )
-        .returning()
-    )[0];
-    if (failed) {
-      await appendProposalEvent(db, proposal, "execution_failed", actor, {
-        actionType: actionTypeName,
-        error:
-          error instanceof ApiError
-            ? error.code
-            : error instanceof Error
-              ? error.message
-              : String(error),
-      });
-    }
+    await db.transaction(async (transaction) => {
+      const tx = transaction as unknown as Db;
+      const failed = (
+        await tx
+          .update(proposals)
+          .set({ state: "execution_failed", updatedAt: new Date() })
+          .where(
+            and(
+              eq(proposals.orgId, proposal.orgId),
+              eq(proposals.id, proposal.id),
+              eq(proposals.state, "executing"),
+            ),
+          )
+          .returning()
+      )[0];
+      if (failed) {
+        await appendProposalEvent(tx, failed, "execution_failed", actor, {
+          actionType: actionTypeName,
+          error:
+            error instanceof ApiError
+              ? error.code
+              : error instanceof Error
+                ? error.message
+                : String(error),
+        });
+      }
+    });
     return true;
   }
 }
@@ -2638,17 +2644,14 @@ async function appendProposalEvent(
     )
     .orderBy(desc(proposalEvents.seq))
     .limit(1);
-  await db
-    .insert(proposalEvents)
-    .values({
-      orgId: proposal.orgId,
-      proposalId: proposal.id,
-      seq: (current[0]?.seq ?? 0) + 1,
-      type,
-      actor,
-      data,
-    })
-    .onConflictDoNothing();
+  await db.insert(proposalEvents).values({
+    orgId: proposal.orgId,
+    proposalId: proposal.id,
+    seq: (current[0]?.seq ?? 0) + 1,
+    type,
+    actor,
+    data,
+  });
 }
 
 function objectOrEmpty(value: unknown): Record<string, unknown> {
