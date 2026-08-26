@@ -4374,6 +4374,8 @@ export interface operations {
                         slug: string;
                         description: string | null;
                         systemVersion: string;
+                        /** @enum {string} */
+                        builderPlanPolicy: "optional" | "required";
                         settings: {
                             [key: string]: unknown;
                         };
@@ -4475,6 +4477,8 @@ export interface operations {
                     name: string;
                     slug: string;
                     description?: string;
+                    /** @enum {string} */
+                    builderPlanPolicy?: "optional" | "required";
                     settings?: {
                         [key: string]: unknown;
                     };
@@ -4495,6 +4499,8 @@ export interface operations {
                         slug: string;
                         description: string | null;
                         systemVersion: string;
+                        /** @enum {string} */
+                        builderPlanPolicy: "optional" | "required";
                         settings: {
                             [key: string]: unknown;
                         };
@@ -4604,6 +4610,8 @@ export interface operations {
                         slug: string;
                         description: string | null;
                         systemVersion: string;
+                        /** @enum {string} */
+                        builderPlanPolicy: "optional" | "required";
                         settings: {
                             [key: string]: unknown;
                         };
@@ -4800,6 +4808,8 @@ export interface operations {
                     name?: string;
                     description?: string;
                     status?: string;
+                    /** @enum {string} */
+                    builderPlanPolicy?: "optional" | "required";
                     settings?: {
                         [key: string]: unknown;
                     };
@@ -4820,6 +4830,8 @@ export interface operations {
                         slug: string;
                         description: string | null;
                         systemVersion: string;
+                        /** @enum {string} */
+                        builderPlanPolicy: "optional" | "required";
                         settings: {
                             [key: string]: unknown;
                         };
@@ -12532,6 +12544,7 @@ export interface operations {
                             };
                             contextMd: string;
                             state: string;
+                            executionError?: string | null;
                             decidedBy: string | null;
                             /** Format: date-time */
                             decidedAt: string | null;
@@ -12554,6 +12567,7 @@ export interface operations {
                             };
                             contextMd: string;
                             state: string;
+                            executionError?: string | null;
                             decidedBy: string | null;
                             /** Format: date-time */
                             decidedAt: string | null;
@@ -12690,6 +12704,7 @@ export interface operations {
                         };
                         contextMd: string;
                         state: string;
+                        executionError?: string | null;
                         decidedBy: string | null;
                         /** Format: date-time */
                         decidedAt: string | null;
@@ -12833,6 +12848,7 @@ export interface operations {
                         };
                         contextMd: string;
                         state: string;
+                        executionError?: string | null;
                         decidedBy: string | null;
                         /** Format: date-time */
                         decidedAt: string | null;
@@ -12963,6 +12979,7 @@ export interface operations {
                         };
                         contextMd: string;
                         state: string;
+                        executionError?: string | null;
                         decidedBy: string | null;
                         /** Format: date-time */
                         decidedAt: string | null;
@@ -13089,6 +13106,7 @@ export interface operations {
                         };
                         contextMd: string;
                         state: string;
+                        executionError?: string | null;
                         decidedBy: string | null;
                         /** Format: date-time */
                         decidedAt: string | null;
@@ -13207,6 +13225,7 @@ export interface operations {
                         };
                         contextMd: string;
                         state: string;
+                        executionError?: string | null;
                         decidedBy: string | null;
                         /** Format: date-time */
                         decidedAt: string | null;
@@ -17661,6 +17680,7 @@ export interface operations {
                         };
                         contextMd: string;
                         state: string;
+                        executionError?: string | null;
                         decidedBy: string | null;
                         /** Format: date-time */
                         decidedAt: string | null;

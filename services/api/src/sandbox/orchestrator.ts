@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   allowedModelsForEngine,
   type FacilityReceipt,
@@ -37,7 +38,10 @@ import {
   sandboxProfiles,
   virtualKeys,
 } from "@facility/db";
+import { isBuilderMode } from "@facility/run-objective";
 import { and, desc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { assertBuilderPlanDispatch, withBuilderPlanPreflight } from "../builder-plan-policy.js";
+import { ApiError } from "../errors.js";
 import {
   createGithubClientFactory,
   FacilityGithubClient,
@@ -102,6 +106,17 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
   try {
     const run = await loadRun(db, job.orgId, job.runId);
     if (run?.status !== "queued") return;
+    await assertBuilderPlanDispatch(db, {
+      orgId: run.orgId,
+      projectId: run.projectId,
+      mode: run.mode,
+      agentDefId: run.agentDefId,
+      trigger: run.trigger,
+      gh: run.gh,
+      runId: run.id,
+      actor: { type: "system", id: "runs.dispatch" },
+      source: "worker_dispatch",
+    });
     // Claim the run atomically. If a duplicate queue delivery raced us and
     // another worker already moved it out of "queued", the update touches no
     // rows and we must NOT launch a second sandbox for the same run.
@@ -111,9 +126,48 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
       .where(and(eq(runs.orgId, run.orgId), eq(runs.id, run.id), eq(runs.status, "queued")))
       .returning({ id: runs.id });
     if (claimed.length === 0) return;
+    // Re-evaluate after the atomic claim. The project policy or mutable agent
+    // definition may change between the producer preflight and queue delivery;
+    // claiming first prevents another worker racing ahead while this final
+    // check fails. The outer failure boundary marks the row failed before any
+    // credential or sandbox side effect is created.
+    const dispatchSnapshot = await withBuilderPlanPreflight(
+      db,
+      {
+        orgId: run.orgId,
+        projectId: run.projectId,
+        mode: run.mode,
+        agentDefId: run.agentDefId,
+        trigger: run.trigger,
+        gh: run.gh,
+        runId: run.id,
+        actor: { type: "system", id: "runs.dispatch" },
+        source: "worker_claimed_dispatch",
+      },
+      async (tx, admission) => {
+        let claimedRun = await loadRun(tx, run.orgId, run.id);
+        if (claimedRun?.status !== "provisioning") return null;
+        if (claimedRun.mode !== admission.mode) {
+          const sealed = (
+            await tx
+              .update(runs)
+              .set({ mode: admission.mode, updatedAt: new Date() })
+              .where(and(eq(runs.orgId, claimedRun.orgId), eq(runs.id, claimedRun.id)))
+              .returning()
+          )[0];
+          if (!sealed) return null;
+          claimedRun = sealed;
+        }
+        // Agent definitions are mutable. Build the complete execution snapshot
+        // while holding the same lock used by name/trigger/contract mutations so
+        // the identity that passed Gate 1 is exactly the identity launched.
+        return buildRunBundle(tx, claimedRun, config);
+      },
+    );
+    if (!dispatchSnapshot) return;
     await appendRunEvents(db, run.orgId, run.id, [{ type: "provisioning", data: {} }]);
 
-    const { bundle, profile, agentPermissions } = await buildRunBundle(db, run, config);
+    const { bundle, profile, agentPermissions } = dispatchSnapshot;
     const virtualKey = await generateApiKey("fvk");
     await db.insert(virtualKeys).values({
       id: virtualKey.id,
@@ -261,9 +315,15 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
     ]);
     await updateGithubRunProgress(db, run.id, "provisioning", { config }).catch(() => undefined);
   } catch (error) {
-    await failRun(db, job.orgId, job.runId, errorMessage(error), "provision_failed").catch(
-      () => undefined,
-    );
+    const builderPlanCode =
+      error instanceof ApiError && error.code.startsWith("builder_plan_") ? error.code : null;
+    await failRun(
+      db,
+      job.orgId,
+      job.runId,
+      builderPlanCode ?? errorMessage(error),
+      builderPlanCode ? "builder_plan_denied" : "provision_failed",
+    ).catch(() => undefined);
     await updateGithubRunProgress(db, job.runId, "failed", { config }).catch(() => undefined);
     // failRun revokes by the persisted sandbox, which on a pre-persist failure
     // wouldn't carry these — so revoke every key we minted, and destroy the
@@ -298,7 +358,18 @@ export async function finishRun(
   },
   deps?: FinishRunDeps,
 ) {
-  if (terminalStatus(run.status)) return run;
+  if (terminalStatus(run.status)) {
+    // A process can die after committing Architect success but before opening
+    // the human Gate 1 proposal. Finish retries are the recovery boundary: the
+    // publication helper is idempotent and repairs the canonical origin event.
+    if (run.status === "succeeded" && isArchitectMode(run.mode)) {
+      const receipt = FacilityReceiptSchema.safeParse(run.receipt);
+      if (receipt.success && verifyFacilityReceipt(receipt.data)) {
+        await openArchitectPlanAcceptance(db, run, receipt.data, deps);
+      }
+    }
+    return run;
+  }
   // A harness run that succeeds must leave the KB valid. If the checkpoint
   // fails, the run is a FAILURE — but resources must still be reclaimed, so we
   // downgrade status here and fall through to cleanup rather than throwing and
@@ -416,13 +487,10 @@ export async function finishRun(
       await openArchitectPlanAcceptance(db, claimed, receipt, deps);
     } catch (planError) {
       const message = errorMessage(planError);
-      status = "failed";
-      error = `plan_publication_failed:${message}`;
-      receipt = await canonicalRunReceipt(db, run, input.receipt, aggregate, status);
-      await db
-        .update(runs)
-        .set({ status, receipt, error, updatedAt: new Date() })
-        .where(and(eq(runs.orgId, run.orgId), eq(runs.id, run.id)));
+      // The sealed Architect work and canonical proposal are already durable.
+      // A transient GitHub publication failure is an artifact-delivery error,
+      // not a reason to rewrite a succeeded receipt as failed. A terminal
+      // finish retry re-enters the idempotent publisher above.
       await appendRunEvents(db, run.orgId, run.id, [
         { type: "artifact_error", data: { kind: "plan_publication_failed", error: message } },
       ]);
@@ -704,8 +772,19 @@ async function openArchitectPlanAcceptance(
       .limit(1)
   )[0];
   if (!actionType) throw new Error("plan_acceptance_action_missing");
-  const existing = (
-    await db
+  const canonicalPayload = {
+    architectRunId: run.id,
+    issueNumber,
+    repoId: repo.id,
+    receiptSha256: receipt.integrity?.payload_sha256,
+    planSha256: createHash("sha256").update(plan).digest("hex"),
+  };
+  const proposal = await db.transaction(async (transaction) => {
+    const tx = transaction as unknown as ReturnType<typeof createDb>["db"];
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`architect-plan:${run.id}`}, 0))`,
+    );
+    const candidates = await tx
       .select()
       .from(proposals)
       .where(
@@ -715,13 +794,65 @@ async function openArchitectPlanAcceptance(
           eq(proposals.runId, run.id),
           eq(proposals.actionTypeId, actionType.id),
         ),
-      )
-      .limit(1)
-  )[0];
-  const proposal =
-    existing ??
-    (
-      await db
+      );
+    for (const existing of candidates) {
+      const payload = objectOrEmpty(existing.payload);
+      if (
+        existing.contextMd !== plan ||
+        payload.architectRunId !== canonicalPayload.architectRunId ||
+        payload.issueNumber !== canonicalPayload.issueNumber ||
+        payload.repoId !== canonicalPayload.repoId ||
+        payload.receiptSha256 !== canonicalPayload.receiptSha256 ||
+        payload.planSha256 !== canonicalPayload.planSha256
+      ) {
+        continue;
+      }
+      const origin = (
+        await tx
+          .select({
+            seq: proposalEvents.seq,
+            type: proposalEvents.type,
+            actor: proposalEvents.actor,
+            data: proposalEvents.data,
+          })
+          .from(proposalEvents)
+          .where(
+            and(
+              eq(proposalEvents.orgId, run.orgId),
+              eq(proposalEvents.proposalId, existing.id),
+              eq(proposalEvents.seq, 1),
+            ),
+          )
+          .limit(1)
+      )[0];
+      const originActor = objectOrEmpty(origin?.actor);
+      const originData = objectOrEmpty(origin?.data);
+      if (
+        origin &&
+        (origin.type !== "open" ||
+          originActor.type !== "agent" ||
+          originActor.id !== run.id ||
+          originData.source !== "architect_run")
+      ) {
+        continue;
+      }
+      if (!origin) {
+        await tx
+          .insert(proposalEvents)
+          .values({
+            orgId: run.orgId,
+            proposalId: existing.id,
+            seq: 1,
+            type: "open",
+            actor: { type: "agent", id: run.id },
+            data: { source: "architect_run" },
+          })
+          .onConflictDoNothing();
+      }
+      return existing;
+    }
+    const created = (
+      await tx
         .insert(proposals)
         .values({
           id: newId("prop"),
@@ -729,71 +860,123 @@ async function openArchitectPlanAcceptance(
           projectId: run.projectId,
           runId: run.id,
           actionTypeId: actionType.id,
-          payload: {
-            architectRunId: run.id,
-            issueNumber,
-            repoId: repo.id,
-            receiptSha256: receipt.integrity?.payload_sha256,
-          },
+          payload: canonicalPayload,
           contextMd: plan,
           expiresAt: new Date(Date.now() + actionType.defaultTtlHours * 3_600_000),
         })
         .returning()
     )[0];
-  if (!proposal) throw new Error("plan_acceptance_create_failed");
-  if (!existing) {
-    await db.insert(proposalEvents).values({
+    if (!created) return undefined;
+    await tx.insert(proposalEvents).values({
       orgId: run.orgId,
-      proposalId: proposal.id,
+      proposalId: created.id,
       seq: 1,
       type: "open",
       actor: { type: "agent", id: run.id },
       data: { source: "architect_run" },
     });
-  }
-  if (!repo?.installationId) throw new Error("run_repo_missing_installation");
-  const installation = (
-    await db
-      .select()
-      .from(githubInstallations)
-      .where(
-        and(
-          eq(githubInstallations.orgId, run.orgId),
-          eq(githubInstallations.id, repo.installationId),
-        ),
-      )
-      .limit(1)
-  )[0];
-  if (!installation || installation.suspendedAt) throw new Error("run_installation_unavailable");
-  const factory =
-    deps?.githubClientFactory ??
-    (deps?.config?.githubAppId && deps.config.githubAppPrivateKey
-      ? createGithubClientFactory(deps.config)
-      : null);
-  if (!factory) throw new Error("github_app_unconfigured");
-  const client = new FacilityGithubClient(await factory(installation.installationId), {
-    owner: repo.owner,
-    repo: repo.name,
-    defaultBranch: repo.defaultBranch,
+    return created;
   });
+  if (!proposal) throw new Error("plan_acceptance_create_failed");
   const body = renderProgressForRun(run, "succeeded", {
     finalText: plan,
     agentProgress: await lastAgentProgress(db, run),
     proposalId: proposal.id,
   });
-  const commentId = progressCommentId(run.gh);
-  if (commentId) {
-    await client.updateIssueComment(commentId, body);
-  } else {
-    await client.createIssueComment(issueNumber, body);
-  }
-  await insertAuditEvent(db, {
-    orgId: run.orgId,
-    projectId: run.projectId,
-    actor: { type: "agent", id: run.id },
-    action: "hitl.proposed",
-    target: { type: "proposal", id: proposal.id },
-    payload: { action_type: "plan_acceptance", issue: issueNumber },
+  await db.transaction(async (transaction) => {
+    const tx = transaction as unknown as ReturnType<typeof createDb>["db"];
+    // Serialize the publication check, GitHub side effect, and ledger write.
+    // A process crash after GitHub accepts the comment can still be at-least-
+    // once on retry, but concurrent finish deliveries cannot both publish.
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`architect-plan:${run.id}`}, 0))`,
+    );
+    const existingPublication = (
+      await tx
+        .select({ seq: proposalEvents.seq })
+        .from(proposalEvents)
+        .where(
+          and(
+            eq(proposalEvents.orgId, run.orgId),
+            eq(proposalEvents.proposalId, proposal.id),
+            eq(proposalEvents.type, "published"),
+          ),
+        )
+        .limit(1)
+    )[0];
+    const publicationFingerprint = `plan_publication_failed:${run.id}`;
+    if (existingPublication) {
+      await resolvePlatformIssue(
+        tx,
+        run.orgId,
+        publicationFingerprint,
+        "Architect plan publication recovered",
+        { projectId: run.projectId },
+      );
+      return;
+    }
+    if (!repo.installationId) throw new Error("run_repo_missing_installation");
+    const installation = (
+      await tx
+        .select()
+        .from(githubInstallations)
+        .where(
+          and(
+            eq(githubInstallations.orgId, run.orgId),
+            eq(githubInstallations.id, repo.installationId),
+          ),
+        )
+        .limit(1)
+    )[0];
+    if (!installation || installation.suspendedAt) throw new Error("run_installation_unavailable");
+    const factory =
+      deps?.githubClientFactory ??
+      (deps?.config?.githubAppId && deps.config.githubAppPrivateKey
+        ? createGithubClientFactory(deps.config)
+        : null);
+    if (!factory) throw new Error("github_app_unconfigured");
+    const client = new FacilityGithubClient(await factory(installation.installationId), {
+      owner: repo.owner,
+      repo: repo.name,
+      defaultBranch: repo.defaultBranch,
+    });
+    const commentId = progressCommentId(run.gh);
+    if (commentId) {
+      await client.updateIssueComment(commentId, body);
+    } else {
+      await client.createIssueComment(issueNumber, body);
+    }
+    const latest = (
+      await tx
+        .select({ seq: proposalEvents.seq })
+        .from(proposalEvents)
+        .where(and(eq(proposalEvents.orgId, run.orgId), eq(proposalEvents.proposalId, proposal.id)))
+        .orderBy(desc(proposalEvents.seq))
+        .limit(1)
+    )[0];
+    await tx.insert(proposalEvents).values({
+      orgId: run.orgId,
+      proposalId: proposal.id,
+      seq: (latest?.seq ?? 0) + 1,
+      type: "published",
+      actor: { type: "agent", id: run.id },
+      data: { source: "architect_run", issue: issueNumber },
+    });
+    await insertAuditEvent(tx, {
+      orgId: run.orgId,
+      projectId: run.projectId,
+      actor: { type: "agent", id: run.id },
+      action: "hitl.proposed",
+      target: { type: "proposal", id: proposal.id },
+      payload: { action_type: "plan_acceptance", issue: issueNumber },
+    });
+    await resolvePlatformIssue(
+      tx,
+      run.orgId,
+      publicationFingerprint,
+      "Architect plan publication recovered",
+      { projectId: run.projectId },
+    );
   });
 }
 
@@ -2333,10 +2516,6 @@ export function platformDeliveryFailure(
   if (!git.pullRequestTitle) return "delivery_pr_title_missing";
   if (!git.pullRequestBody) return "delivery_pr_body_missing";
   return null;
-}
-
-function isBuilderMode(mode: string) {
-  return mode === "builder" || mode.endsWith("-builder");
 }
 
 function isArchitectMode(mode: string) {

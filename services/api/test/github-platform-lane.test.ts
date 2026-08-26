@@ -1,5 +1,6 @@
 import { generateApiKey, hashKey, newId } from "@facility/core";
 import {
+  actionTypes,
   agentDefs,
   apiKeys,
   auditEvents,
@@ -16,6 +17,7 @@ import {
   platformIssues,
   previewSandboxes,
   projects,
+  proposalEvents,
   proposals,
   registryItems,
   repos,
@@ -2303,18 +2305,43 @@ describe("github platform lane", async () => {
         observedAt: new Date("2026-08-01T01:02:00Z"),
       },
     ]);
-    const legacyProposal = await app.inject({
-      method: "POST",
-      url: "/v1/proposals",
-      headers: { cookie },
-      payload: {
-        projectId,
-        actionType: "plan_acceptance",
-        payload: { issueNumber: number },
-        contextMd: "Legacy proposal without a repository id",
-      },
+    const planAcceptance = (
+      await db
+        .select({ id: actionTypes.id })
+        .from(actionTypes)
+        .where(and(eq(actionTypes.orgId, orgId), eq(actionTypes.name, "plan_acceptance")))
+        .limit(1)
+    )[0];
+    if (!planAcceptance) throw new Error("plan_acceptance action fixture missing");
+    const legacyArchitectRun = await insertRun({
+      mode: "architect",
+      status: "succeeded",
+      gh: { issueNumber: number },
     });
-    expect(legacyProposal.statusCode, legacyProposal.body).toBe(200);
+    const legacyProposal = (
+      await db
+        .insert(proposals)
+        .values({
+          id: newId("prop"),
+          orgId,
+          projectId,
+          runId: legacyArchitectRun.id,
+          actionTypeId: planAcceptance.id,
+          payload: { architectRunId: legacyArchitectRun.id, issueNumber: number },
+          contextMd: "Legacy proposal without a repository id",
+          expiresAt: new Date(Date.now() + 3_600_000),
+        })
+        .returning()
+    )[0];
+    if (!legacyProposal) throw new Error("legacy proposal fixture missing");
+    await db.insert(proposalEvents).values({
+      orgId,
+      proposalId: legacyProposal.id,
+      seq: 1,
+      type: "open",
+      actor: { type: "agent", id: legacyArchitectRun.id },
+      data: { source: "architect_run" },
+    });
 
     const pipeline = await app.inject({
       method: "GET",
@@ -3109,7 +3136,14 @@ describe("github platform lane", async () => {
       }) as never;
     const repo = await insertRepoWithInstallation(`trigger-${Date.now()}`);
     await insertIssue(repo.id, 44, "open", "2026-03-01T00:00:00Z");
-    await insertAgent("builder");
+    const storyBuilder = await insertAgent("builder");
+    await db
+      .update(agentDefs)
+      .set({
+        name: "delivery-specialist",
+        triggers: [{ type: "command", handle: "/builder" }],
+      })
+      .where(eq(agentDefs.id, storyBuilder.id));
 
     const forged = await app.inject({
       method: "POST",
@@ -3162,6 +3196,7 @@ describe("github platform lane", async () => {
       payload: { agent: "builder" },
     });
     expect(response.statusCode).toBe(200);
+    expect(response.json().mode).toBe("builder");
     expect(response.json().gh.issueNumber).toBe(44);
     const [manifestSyncedRepo] = await db.select().from(repos).where(eq(repos.id, repo.id));
     expect(manifestSyncedRepo?.renderAnswers).toMatchObject({
@@ -3402,6 +3437,123 @@ describe("github platform lane", async () => {
     });
     expect(denied.statusCode).toBe(403);
     app.githubClientFactory = undefined;
+  });
+
+  it("denies Story Build before GitHub access, row creation, or enqueue when plans are required", async () => {
+    const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const governedProject = (
+      await db
+        .insert(projects)
+        .values({
+          id: newId("proj"),
+          orgId,
+          name: `Governed Story Build ${suffix}`,
+          slug: `governed-story-build-${suffix}`,
+          builderPlanPolicy: "required",
+          settings: {},
+        })
+        .returning()
+    )[0];
+    if (!governedProject) throw new Error("governed project insert failed");
+    const contract = (
+      await db
+        .insert(registryItems)
+        .values({
+          id: newId("item"),
+          orgId,
+          scope: "project",
+          projectId: governedProject.id,
+          kind: "agent_contract",
+          name: `governed-story-build-${suffix}`,
+          latestVersion: 1,
+        })
+        .returning()
+    )[0];
+    if (!contract) throw new Error("governed contract insert failed");
+    const governedBuilder = (
+      await db
+        .insert(agentDefs)
+        .values({
+          id: newId("agent"),
+          orgId,
+          projectId: governedProject.id,
+          name: "delivery-specialist",
+          engine: "codex",
+          model: { primary: "gpt-5.5" },
+          contractItemId: contract.id,
+          triggers: [{ type: "command", handle: "/builder" }],
+          enabled: true,
+        })
+        .returning()
+    )[0];
+    if (!governedBuilder) throw new Error("governed Builder insert failed");
+    const governedRepo = (
+      await db
+        .insert(repos)
+        .values({
+          id: newId("repo"),
+          orgId,
+          projectId: governedProject.id,
+          owner: `governed-story-${suffix}`,
+          name: "facility",
+          defaultBranch: "main",
+        })
+        .returning()
+    )[0];
+    if (!governedRepo) throw new Error("governed repository insert failed");
+    await db.insert(ghIssues).values({
+      id: newId("ghi"),
+      orgId,
+      projectId: governedProject.id,
+      repoId: governedRepo.id,
+      number: 204,
+      title: "Build only after Gate 1",
+      state: "open",
+      labels: [],
+      assignees: [],
+      htmlUrl: `https://github.test/${governedRepo.owner}/${governedRepo.name}/issues/204`,
+    });
+
+    const originalFactory = app.githubClientFactory;
+    const originalEnqueue = app.enqueue;
+    let githubFactoryCalls = 0;
+    const enqueued: Array<{ queue: string; data: Record<string, unknown> }> = [];
+    app.githubClientFactory = async () => {
+      githubFactoryCalls += 1;
+      throw new Error("Story Build denial reached GitHub");
+    };
+    app.enqueue = async (queue, data) => {
+      enqueued.push({ queue, data });
+      return null;
+    };
+    const before = await db
+      .select({ id: runs.id })
+      .from(runs)
+      .where(eq(runs.projectId, governedProject.id));
+    try {
+      const denied = await app.inject({
+        method: "POST",
+        url: `/v1/projects/${governedProject.id}/issues/204/trigger?repoId=${governedRepo.id}`,
+        headers: { cookie },
+        payload: { agent: "builder" },
+      });
+      expect(denied.statusCode, denied.body).toBe(409);
+      expect(denied.json().error.code).toBe("builder_plan_required");
+      expect(
+        await db.select({ id: runs.id }).from(runs).where(eq(runs.projectId, governedProject.id)),
+      ).toHaveLength(before.length);
+      expect(githubFactoryCalls).toBe(0);
+      expect(enqueued).toEqual([]);
+      const denial = (
+        await db.select().from(auditEvents).where(eq(auditEvents.projectId, governedProject.id))
+      ).find((event) => event.action === "run.builder_plan_denied");
+      expect(denial).toMatchObject({
+        payload: { code: "builder_plan_required", source: "web_issue_preflight" },
+      });
+    } finally {
+      app.githubClientFactory = originalFactory;
+      app.enqueue = originalEnqueue;
+    }
   });
 
   it("pins project-scoped keys to their project across the issue mirror (404 elsewhere)", async () => {
@@ -4593,6 +4745,112 @@ describe("github platform lane", async () => {
     const [proposal] = await db.select().from(proposals).where(eq(proposals.runId, run.id));
     expect(proposal?.state).toBe("open");
     expect(proposal?.payload).toMatchObject({ issueNumber: 71, repoId: repo.id });
+  });
+
+  it("keeps a sealed Architect success durable and retries transient plan publication", async () => {
+    const repo = await insertRepoWithInstallation(`plan-retry-${Date.now()}`);
+    const run = await insertRun({
+      mode: "architect",
+      status: "running",
+      gh: { owner: repo.owner, repo: repo.name, issueNumber: 72 },
+    });
+    await db.insert(runEvents).values({
+      orgId,
+      runId: run.id,
+      seq: 1,
+      type: "assistant",
+      data: { text: "Retry this plan publication without rewriting Architect success." },
+    });
+
+    const first = await finishRun(
+      db,
+      run,
+      { status: "succeeded" },
+      {
+        config,
+        githubClientFactory: async () => {
+          throw new Error("transient github outage");
+        },
+      },
+    );
+    expect(first.status).toBe("succeeded");
+    const stored = (await db.select().from(runs).where(eq(runs.id, run.id)).limit(1))[0];
+    expect(stored).toMatchObject({ status: "succeeded", error: null });
+    const planRows = await db.select().from(proposals).where(eq(proposals.runId, run.id));
+    expect(planRows).toHaveLength(1);
+    expect(
+      await db
+        .select()
+        .from(proposalEvents)
+        .where(
+          and(
+            eq(proposalEvents.proposalId, planRows[0]?.id ?? ""),
+            eq(proposalEvents.type, "published"),
+          ),
+        ),
+    ).toHaveLength(0);
+    const publicationError = (
+      await db
+        .select()
+        .from(runEvents)
+        .where(and(eq(runEvents.runId, run.id), eq(runEvents.type, "artifact_error")))
+    ).find((event) => (event.data as { kind?: unknown }).kind === "plan_publication_failed");
+    expect(publicationError?.data).toMatchObject({ error: "transient github outage" });
+    const publicationIssue = (
+      await db
+        .select()
+        .from(platformIssues)
+        .where(eq(platformIssues.fingerprint, `plan_publication_failed:${run.id}`))
+        .limit(1)
+    )[0];
+    expect(publicationIssue?.state).toBe("open");
+
+    const comments: string[] = [];
+    if (!stored) throw new Error("stored Architect run missing");
+    const retryDeps = {
+      config,
+      githubClientFactory: async () =>
+        ({
+          rest: {
+            issues: {
+              createComment: async ({ body }: { body: string }) => {
+                comments.push(body);
+                await new Promise((resolve) => setTimeout(resolve, 5));
+                return { data: { id: 72 } };
+              },
+            },
+            repos: {},
+            pulls: {},
+            git: {},
+          },
+        }) as never,
+    };
+    const retried = await Promise.all([
+      finishRun(db, stored, { status: "succeeded" }, retryDeps),
+      finishRun(db, stored, { status: "succeeded" }, retryDeps),
+    ]);
+    expect(retried.every((result) => result.status === "succeeded")).toBe(true);
+    expect(comments).toHaveLength(1);
+    expect(await db.select().from(proposals).where(eq(proposals.runId, run.id))).toHaveLength(1);
+    expect(
+      await db
+        .select()
+        .from(proposalEvents)
+        .where(
+          and(
+            eq(proposalEvents.proposalId, planRows[0]?.id ?? ""),
+            eq(proposalEvents.type, "published"),
+          ),
+        ),
+    ).toHaveLength(1);
+    const resolvedPublicationIssue = (
+      await db
+        .select()
+        .from(platformIssues)
+        .where(eq(platformIssues.id, publicationIssue?.id ?? ""))
+        .limit(1)
+    )[0];
+    expect(resolvedPublicationIssue?.state).toBe("resolved");
   });
 
   it("keeps a successful run durable while transient PR delivery retries", async () => {

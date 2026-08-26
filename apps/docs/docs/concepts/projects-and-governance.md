@@ -43,3 +43,81 @@ never silently overwritten. The fingerprint advances only when the PR merges.
 Every project records its system version. Org policy can pin projects,
 preview diffs between versions, and roll forward on your schedule — the whole
 method is data, not folklore.
+
+## Required Architect plans for Builder
+
+Projects can set `builderPlanPolicy` to `optional` or `required`. The default is
+`optional`, including for projects created before this setting existed, so an
+upgrade does not silently change their dispatch behavior.
+
+Within the Facility platform lane, `required` makes Gate 1 a runtime invariant. A Builder can only be created by
+the internal executor for an approved `plan_acceptance` proposal with trusted
+freshness evidence. Run-now,
+Story Build, GitHub slash commands, MCP tools, resumes, schedules, and inbound
+integrations cannot create an unlinked Builder run. There is no break-glass
+route.
+
+Facility accepts `required` only when every connected repository has a recent
+`ok` fingerprint from its default branch and routes both `builder` and
+`codex-builder` to `platform`. Connecting another repository requires switching
+back to `optional`, connecting and verifying its platform configuration, then
+re-enabling the gate. The generated repo-lane workflow does not yet call this
+policy and must not remain enabled for Builder on a required project.
+If the default-branch manifest later removes either platform lane, Facility
+marks the repository fingerprint drifted and rejects the synchronized config;
+restore and verify the governed files before dispatching again.
+Managed pushes mark the fingerprint pending before asynchronous verification,
+and approval rechecks the cached lane plus a recent `ok` fingerprint. This
+foundation is webhook-backed rather than a live GitHub read at every approval;
+the freshness follow-up described below must add that live revalidation before
+`required` becomes operational.
+
+Policy activation, run admission, repository mutation, and Builder-relevant
+agent mutations share a per-project transaction lock. Admission also persists
+an immutable canonical `builder` or `codex-builder` run mode; later edits to an
+agent name or command trigger cannot erase the role the run was admitted as.
+Enabling `required` conservatively refuses to proceed while any older run is
+non-terminal. This covers legacy rows created before immutable admission and
+prevents a run that observed `optional` from crossing the activation boundary.
+
+Denials use stable API and audit codes:
+
+- `builder_plan_required` when no acceptance was supplied;
+- `builder_plan_expired`, `builder_plan_rejected`, or
+  `builder_plan_already_consumed` for proposal lifecycle failures;
+- `builder_plan_stale` when the recorded base or issue revision changed;
+- `builder_plan_freshness_unavailable` when Facility cannot prove that those
+  revisions are still current; and
+- `builder_plan_context_invalid` for malformed or non-canonical provenance.
+
+The acceptance records the exact plan SHA-256, approving human principal and time,
+Architect receipt, repository, and issue. Base-commit provenance must come from
+the workspace/base tracking contract, and issue freshness must come from a live,
+canonical digest of the exact Architect issue scope rather than the mutable
+mirror timestamp. If either trusted provider is unavailable, `required` denies
+Builder with `builder_plan_freshness_unavailable`; it never falls back to caller
+input.
+For a required project, an API key or agent cannot supply the approval event;
+the approving principal must be a Facility user or the authenticated GitHub
+human who issued the canonical `/builder` command, and must be distinct from
+the proposal opener.
+
+This change is the policy/configuration foundation, not a usable production
+Gate 1 by itself. At this revision, no real dispatch path supplies trusted live
+freshness evidence and the Architect proposal producer does not yet persist the
+workspace-base and canonical issue-revision envelope. Consequently, enabling
+`required` intentionally blocks every Builder attempt with
+`builder_plan_freshness_unavailable`, including an otherwise canonical approval.
+Compose the workspace-base provenance work from #166 with a live, versioned
+GitHub issue digest at both approval and worker dispatch before enabling the
+policy. Proposals created before that coherent deployment are not backfilled:
+run Architect again, approve the new proposal, and do not edit or reuse the old
+one.
+
+Two operational follow-ups remain in this foundation. A generic inbound event
+denied by the gate stays unprocessed, and replaying the same delivery ID does
+not automatically execute it again; an operator must create a fresh delivery
+after correcting the source workflow. Also, the web UI disables Builder trigger
+controls while `required` is active, including editing an existing Builder
+schedule. Remove or change that schedule before activation (or temporarily
+return the project to `optional` through the governed project settings flow).

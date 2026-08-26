@@ -743,6 +743,7 @@ describe("db", async () => {
            OR (table_name = 'spend_counters' AND column_name = 'spent_cents')
            OR (table_name = 'analytics_daily' AND column_name IN ('cost_cents', 'outcomes_assessed', 'outcomes_accepted'))
            OR (table_name = 'provider_credentials' AND column_name = 'auth_mode')
+           OR (table_name = 'projects' AND column_name = 'builder_plan_policy')
       `,
     )) as Iterable<{ table_name: string; column_name: string; data_type: string }>;
     const columnTypes = new Map(
@@ -757,6 +758,7 @@ describe("db", async () => {
     expect(columnTypes.get("analytics_daily.outcomes_assessed")).toBe("integer");
     expect(columnTypes.get("analytics_daily.outcomes_accepted")).toBe("integer");
     expect(columnTypes.get("provider_credentials.auth_mode")).toBe("text");
+    expect(columnTypes.get("projects.builder_plan_policy")).toBe("text");
     const indexes = (await db.execute(
       sql`
         SELECT indexname
@@ -864,6 +866,17 @@ describe("db", async () => {
     expect(Array.from(ciEventChecks).map((row) => row.conname)).toEqual([
       "gh_ci_events_state_check",
     ]);
+    const projectChecks = (await db.execute(
+      sql`
+        SELECT conname
+        FROM pg_constraint
+        WHERE conrelid = 'projects'::regclass
+          AND conname = 'projects_builder_plan_policy_check'
+      `,
+    )) as Iterable<{ conname: string }>;
+    expect(Array.from(projectChecks).map((row) => row.conname)).toEqual([
+      "projects_builder_plan_policy_check",
+    ]);
     const applied = (await db.execute(
       sql`
         SELECT name
@@ -874,7 +887,7 @@ describe("db", async () => {
     // A developer database can include later migrations from another worktree;
     // assert this checkout's latest migration was applied without assuming it
     // is the newest row in that shared database.
-    expect(Array.from(applied).map((row) => row.name)).toContain("0041_github_ci_story_events.sql");
+    expect(Array.from(applied).map((row) => row.name)).toContain("0043_builder_plan_policy.sql");
     const providerCredentialChecks = (await db.execute(
       sql`
         SELECT conname

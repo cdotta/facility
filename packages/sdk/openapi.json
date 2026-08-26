@@ -3603,6 +3603,13 @@
                       "systemVersion": {
                         "type": "string"
                       },
+                      "builderPlanPolicy": {
+                        "type": "string",
+                        "enum": [
+                          "optional",
+                          "required"
+                        ]
+                      },
                       "settings": {
                         "type": "object",
                         "additionalProperties": {}
@@ -3626,6 +3633,7 @@
                       "slug",
                       "description",
                       "systemVersion",
+                      "builderPlanPolicy",
                       "settings",
                       "status",
                       "createdAt",
@@ -3750,6 +3758,13 @@
                   "description": {
                     "type": "string"
                   },
+                  "builderPlanPolicy": {
+                    "type": "string",
+                    "enum": [
+                      "optional",
+                      "required"
+                    ]
+                  },
                   "settings": {
                     "type": "object",
                     "additionalProperties": {}
@@ -3790,6 +3805,13 @@
                     "systemVersion": {
                       "type": "string"
                     },
+                    "builderPlanPolicy": {
+                      "type": "string",
+                      "enum": [
+                        "optional",
+                        "required"
+                      ]
+                    },
                     "settings": {
                       "type": "object",
                       "additionalProperties": {}
@@ -3813,6 +3835,7 @@
                     "slug",
                     "description",
                     "systemVersion",
+                    "builderPlanPolicy",
                     "settings",
                     "status",
                     "createdAt",
@@ -3972,6 +3995,13 @@
                     "systemVersion": {
                       "type": "string"
                     },
+                    "builderPlanPolicy": {
+                      "type": "string",
+                      "enum": [
+                        "optional",
+                        "required"
+                      ]
+                    },
                     "settings": {
                       "type": "object",
                       "additionalProperties": {}
@@ -3995,6 +4025,7 @@
                     "slug",
                     "description",
                     "systemVersion",
+                    "builderPlanPolicy",
                     "settings",
                     "status",
                     "createdAt",
@@ -4118,6 +4149,13 @@
                   "status": {
                     "type": "string"
                   },
+                  "builderPlanPolicy": {
+                    "type": "string",
+                    "enum": [
+                      "optional",
+                      "required"
+                    ]
+                  },
                   "settings": {
                     "type": "object",
                     "additionalProperties": {}
@@ -4164,6 +4202,13 @@
                     "systemVersion": {
                       "type": "string"
                     },
+                    "builderPlanPolicy": {
+                      "type": "string",
+                      "enum": [
+                        "optional",
+                        "required"
+                      ]
+                    },
                     "settings": {
                       "type": "object",
                       "additionalProperties": {}
@@ -4187,6 +4232,7 @@
                     "slug",
                     "description",
                     "systemVersion",
+                    "builderPlanPolicy",
                     "settings",
                     "status",
                     "createdAt",
@@ -18258,6 +18304,10 @@
                           "state": {
                             "type": "string"
                           },
+                          "executionError": {
+                            "nullable": true,
+                            "type": "string"
+                          },
                           "decidedBy": {
                             "nullable": true,
                             "type": "string"
@@ -18332,6 +18382,10 @@
                             "type": "string"
                           },
                           "state": {
+                            "type": "string"
+                          },
+                          "executionError": {
+                            "nullable": true,
                             "type": "string"
                           },
                           "decidedBy": {
@@ -18607,6 +18661,10 @@
                     "state": {
                       "type": "string"
                     },
+                    "executionError": {
+                      "nullable": true,
+                      "type": "string"
+                    },
                     "decidedBy": {
                       "nullable": true,
                       "type": "string"
@@ -18870,6 +18928,10 @@
                     "state": {
                       "type": "string"
                     },
+                    "executionError": {
+                      "nullable": true,
+                      "type": "string"
+                    },
                     "decidedBy": {
                       "nullable": true,
                       "type": "string"
@@ -19099,6 +19161,10 @@
                       "type": "string"
                     },
                     "state": {
+                      "type": "string"
+                    },
+                    "executionError": {
+                      "nullable": true,
                       "type": "string"
                     },
                     "decidedBy": {
@@ -19340,6 +19406,10 @@
                     "state": {
                       "type": "string"
                     },
+                    "executionError": {
+                      "nullable": true,
+                      "type": "string"
+                    },
                     "decidedBy": {
                       "nullable": true,
                       "type": "string"
@@ -19539,6 +19609,10 @@
                       "type": "string"
                     },
                     "state": {
+                      "type": "string"
+                    },
+                    "executionError": {
+                      "nullable": true,
                       "type": "string"
                     },
                     "decidedBy": {
@@ -27392,6 +27466,10 @@
                       "type": "string"
                     },
                     "state": {
+                      "type": "string"
+                    },
+                    "executionError": {
+                      "nullable": true,
                       "type": "string"
                     },
                     "decidedBy": {
