@@ -14,9 +14,13 @@ import { and, desc, eq, notInArray, sql } from "drizzle-orm";
 import type { FastifyInstance, FastifyReply } from "fastify";
 import postgres from "postgres";
 import { z } from "zod";
-import { withBuilderPlanPreflight } from "../../builder-plan-policy.js";
+import {
+  assertGenericRunResumeAllowed,
+  withBuilderPlanPreflight,
+} from "../../builder-plan-policy.js";
 import { readTranscriptObject } from "../../envelopes.js";
 import { ApiError, notFound } from "../../errors.js";
+import { createGovernedBuilderRetry } from "../../governed-builder-retry.js";
 import { acquireExclusiveRunTransitionTransactionLease } from "../../run-api-key-lease.js";
 import { cancelRun, revokeRunKeys } from "../../sandbox/orchestrator.js";
 import {
@@ -500,6 +504,54 @@ export async function registerRunsRoutes(app: FastifyInstance, context: V1RouteC
   );
 
   app.post(
+    "/v1/runs/:runId/retry",
+    {
+      config: { permission: "runs:trigger", idempotent: true, runLifecycle: true },
+      schema: {
+        params: IdParams,
+        body: z
+          .object({ reason: z.string().max(500).optional() })
+          .strict()
+          .nullable()
+          .default({}),
+        response: { 200: RunSchema },
+      },
+    },
+    async (request) => {
+      if (!config.governedBuilderRetryPromotionEnabled) {
+        throw new ApiError(
+          409,
+          "governed_retry_promotion_disabled",
+          "Governed Builder retry is not enabled on this Facility deployment",
+          { requiredAction: "complete_retry_worker_rollout_and_enable_promotion" },
+        );
+      }
+      const p = principal(request);
+      const { runId } = request.params as { runId: string };
+      const body = (request.body ?? {}) as { reason?: string };
+      const result = await createGovernedBuilderRetry(
+        db,
+        app.runTransitionDb,
+        {
+          orgId: p.orgId,
+          projectId: p.projectId,
+          parentRunId: runId,
+          actor: auditActor(p),
+          reason: body.reason,
+        },
+        {
+          config,
+          githubFactory: app.githubClientFactory,
+        },
+      );
+      if (result.run.status === "queued") {
+        await app.enqueue("runs.dispatch", { runId: result.run.id, orgId: result.run.orgId });
+      }
+      return redactRunSecrets(result.run);
+    },
+  );
+
+  app.post(
     "/v1/runs/:runId/cancel",
     {
       config: {
@@ -805,6 +857,7 @@ export async function registerRunsRoutes(app: FastifyInstance, context: V1RouteC
       const p = principal(request);
       const { runId } = request.params as { runId: string };
       const parent = await loadRun(p, runId);
+      await assertGenericRunResumeAllowed(db, parent);
       if (!terminalStatus(parent.status)) {
         throw new ApiError(409, "run_not_terminal", "Only terminal runs can be resumed");
       }

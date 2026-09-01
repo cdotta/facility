@@ -50,6 +50,12 @@ export type AppConfig = {
    * old /push-token handler and create unrecorded write authority.
    */
   repositoryWriteTrackingPromotionEnabled?: boolean;
+  /**
+   * Phase-two rollout gate for creating governed Builder successor rows. Keep
+   * false until every worker understands and revalidates immutable retry
+   * lineage. Existing successor rows remain enforceable when this is false.
+   */
+  governedBuilderRetryPromotionEnabled?: boolean;
   // Driver the seeded default sandbox profile uses.
   sandboxDriver: "docker" | "aws" | "vercel";
   authIdentityProvider?: "github" | "oidc";

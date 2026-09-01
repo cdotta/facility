@@ -1242,6 +1242,177 @@ describe("db", async () => {
     ).toHaveLength(1);
   });
 
+  it("enforces tenant-scoped immutable linear Builder retry lineage", async () => {
+    const orgId = newId("org");
+    const projectId = newId("proj");
+    const otherProjectId = newId("proj");
+    await db.insert(schema.orgs).values({
+      id: orgId,
+      name: "Retry Lineage",
+      slug: `retry-lineage-${orgId}`,
+      settings: {},
+    });
+    await db.insert(schema.projects).values([
+      { id: projectId, orgId, name: "Retry Lineage", slug: `retry-${projectId}`, settings: {} },
+      {
+        id: otherProjectId,
+        orgId,
+        name: "Other Retry Lineage",
+        slug: `retry-${otherProjectId}`,
+        settings: {},
+      },
+    ]);
+    for (const source of [undefined, null] as const) {
+      const invalidTrigger = source === undefined ? {} : { source };
+      const invalidParent = (
+        await db
+          .insert(schema.runs)
+          .values({
+            id: newId("run"),
+            orgId,
+            projectId,
+            mode: "builder",
+            engine: "codex",
+            status: "failed",
+            trigger: invalidTrigger,
+            createdBy: { type: "system", id: "invalid-parent" },
+          })
+          .returning()
+      )[0];
+      if (!invalidParent) throw new Error("invalid retry parent fixture missing");
+      await expectCheckViolation(
+        db.insert(schema.runs).values({
+          id: newId("run"),
+          orgId,
+          projectId,
+          retryOfRunId: invalidParent.id,
+          mode: invalidParent.mode,
+          engine: invalidParent.engine,
+          trigger: invalidTrigger,
+          createdBy: { type: "system", id: "invalid-child" },
+        }),
+        { constraintName: "runs_retry_parent_state_check" },
+      );
+    }
+    const trigger = {
+      source: "plan_acceptance",
+      proposalId: newId("prop"),
+      architectRunId: newId("run"),
+      approvedPlan: "Immutable plan",
+    };
+    const root = (
+      await db
+        .insert(schema.runs)
+        .values({
+          id: newId("run"),
+          orgId,
+          projectId,
+          mode: "builder",
+          engine: "codex",
+          status: "failed",
+          trigger,
+          createdBy: { type: "system", id: "test" },
+        })
+        .returning()
+    )[0];
+    if (!root) throw new Error("retry root fixture missing");
+    for (const status of ["queued", "running"] as const) {
+      await expectCheckViolation(
+        db.update(schema.runs).set({ status }).where(eq(schema.runs.id, root.id)),
+        { constraintName: "runs_retry_parent_status_immutable" },
+      );
+    }
+    const child = (
+      await db
+        .insert(schema.runs)
+        .values({
+          id: newId("run"),
+          orgId,
+          projectId,
+          retryOfRunId: root.id,
+          mode: root.mode,
+          engine: root.engine,
+          trigger,
+          createdBy: { type: "system", id: "test" },
+        })
+        .returning()
+    )[0];
+    expect(child?.retryOfRunId).toBe(root.id);
+
+    await expect(
+      db.insert(schema.runs).values({
+        id: newId("run"),
+        orgId,
+        projectId,
+        retryOfRunId: root.id,
+        mode: root.mode,
+        engine: root.engine,
+        trigger,
+        createdBy: { type: "system", id: "duplicate" },
+      }),
+    ).rejects.toMatchObject({
+      cause: { code: "23505", constraint_name: "runs_retry_of_run_uidx" },
+    });
+    await expectCheckViolation(
+      db.insert(schema.runs).values({
+        id: newId("run"),
+        orgId,
+        projectId,
+        retryOfRunId: root.id,
+        mode: root.mode,
+        engine: root.engine,
+        trigger: { ...trigger, approvedPlan: "forged" },
+        createdBy: { type: "system", id: "forged" },
+      }),
+      { constraintName: "runs_retry_identity_check" },
+    );
+    await expect(
+      db.insert(schema.runs).values({
+        id: newId("run"),
+        orgId,
+        projectId: otherProjectId,
+        retryOfRunId: root.id,
+        mode: root.mode,
+        engine: root.engine,
+        trigger,
+        createdBy: { type: "system", id: "cross-project" },
+      }),
+    ).rejects.toMatchObject({ cause: { code: "23503", constraint_name: "runs_retry_parent_fk" } });
+    if (!child) throw new Error("retry child fixture missing");
+    await expectCheckViolation(
+      db.update(schema.runs).set({ mode: "codex-builder" }).where(eq(schema.runs.id, child.id)),
+      { constraintName: "runs_retry_identity_immutable" },
+    );
+    await expectCheckViolation(
+      db
+        .update(schema.runs)
+        .set({ trigger: { ...trigger, approvedPlan: "mutated root" } })
+        .where(eq(schema.runs.id, root.id)),
+      { constraintName: "runs_retry_parent_identity_immutable" },
+    );
+
+    await db
+      .update(schema.runs)
+      .set({ status: "failed", endedAt: new Date() })
+      .where(eq(schema.runs.id, child.id));
+    const grandchild = (
+      await db
+        .insert(schema.runs)
+        .values({
+          id: newId("run"),
+          orgId,
+          projectId,
+          retryOfRunId: child.id,
+          mode: child.mode,
+          engine: child.engine,
+          trigger,
+          createdBy: { type: "system", id: "test" },
+        })
+        .returning()
+    )[0];
+    expect(grandchild?.retryOfRunId).toBe(child.id);
+  });
+
   it("applies metering precision and index migrations in order", async () => {
     const columns = (await db.execute(
       sql`
@@ -1253,6 +1424,7 @@ describe("db", async () => {
            OR (table_name = 'provider_credentials' AND column_name = 'auth_mode')
            OR (table_name = 'projects' AND column_name = 'builder_plan_policy')
            OR (table_name = 'runs' AND column_name = 'workspace_base_sha')
+           OR (table_name = 'runs' AND column_name = 'retry_of_run_id')
            OR (table_name = 'run_deliveries' AND column_name = 'base_sha')
       `,
     )) as Iterable<{ table_name: string; column_name: string; data_type: string }>;
@@ -1270,6 +1442,7 @@ describe("db", async () => {
     expect(columnTypes.get("provider_credentials.auth_mode")).toBe("text");
     expect(columnTypes.get("projects.builder_plan_policy")).toBe("text");
     expect(columnTypes.get("runs.workspace_base_sha")).toBe("text");
+    expect(columnTypes.get("runs.retry_of_run_id")).toBe("text");
     expect(columnTypes.get("run_deliveries.base_sha")).toBe("text");
     const indexes = (await db.execute(
       sql`
@@ -1294,6 +1467,7 @@ describe("db", async () => {
           'registry_versions_one_active_uidx',
           'runs_plan_acceptance_proposal_uidx',
           'runs_plan_acceptance_architect_run_uidx',
+          'runs_retry_of_run_uidx',
           'webhook_deliveries_pending_idx',
           'webhook_deliveries_org_created_idx',
           'idempotency_records_expiry_idx',
@@ -1333,6 +1507,7 @@ describe("db", async () => {
         "runs_plan_acceptance_proposal_uidx",
         // Duplicate proposals for one architect plan cannot double-dispatch (migration 0020).
         "runs_plan_acceptance_architect_run_uidx",
+        "runs_retry_of_run_uidx",
         // Durable integration outbox and API replay records (migrations 0021-0022).
         "webhook_deliveries_pending_idx",
         "webhook_deliveries_org_created_idx",
@@ -1401,6 +1576,9 @@ describe("db", async () => {
     // is the newest row in that shared database.
     expect(Array.from(applied).map((row) => row.name)).toContain(
       "0044_run_repository_write_leases.sql",
+    );
+    expect(Array.from(applied).map((row) => row.name)).toContain(
+      "0045_governed_builder_retry_lineage.sql",
     );
     expect(Array.from(applied).map((row) => row.name)).toContain("0043_builder_plan_policy.sql");
     expect(Array.from(applied).map((row) => row.name)).toContain(

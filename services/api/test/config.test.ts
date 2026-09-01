@@ -27,6 +27,16 @@ const validProductionOauthEnv = {
 };
 
 describe("API configuration", () => {
+  it("keeps governed Builder retry promotion fail-closed until explicitly enabled", () => {
+    expect(readConfig(validEnv).governedBuilderRetryPromotionEnabled).toBe(false);
+    expect(
+      readConfig({
+        ...validEnv,
+        FACILITY_GOVERNED_BUILDER_RETRY_PROMOTION: "1",
+      }).governedBuilderRetryPromotionEnabled,
+    ).toBe(true);
+  });
+
   it("accepts a master key that decodes to exactly 32 bytes", () => {
     expect(readConfig(validEnv).secretMasterKey).toBe(validEnv.SECRET_MASTER_KEY);
   });

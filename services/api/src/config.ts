@@ -50,6 +50,7 @@ const EnvSchema = z
     // seeded default sandbox profile and `facility doctor` both key off this.
     FACILITY_RUNNER_IMAGE: z.string().default("facility-runner:dev"),
     FACILITY_REPOSITORY_WRITE_TRACKING_PROMOTION: z.enum(["0", "1"]).default("0"),
+    FACILITY_GOVERNED_BUILDER_RETRY_PROMOTION: z.enum(["0", "1"]).default("0"),
     // Driver the seeded default sandbox profile uses. Must match the deployment:
     // "docker" for local/self-host, "vercel" for managed Sandboxes, or "aws"
     // for the CodeBuild development provider.
@@ -273,6 +274,7 @@ export function readConfig(env = process.env): AppConfig {
     sandboxRunnerImage: parsed.FACILITY_RUNNER_IMAGE,
     repositoryWriteTrackingPromotionEnabled:
       parsed.FACILITY_REPOSITORY_WRITE_TRACKING_PROMOTION === "1",
+    governedBuilderRetryPromotionEnabled: parsed.FACILITY_GOVERNED_BUILDER_RETRY_PROMOTION === "1",
     sandboxDriver: parsed.FACILITY_SANDBOX_DRIVER,
     authIdentityProvider: parsed.AUTH_IDENTITY_PROVIDER,
     authCallbackUrl: parsed.AUTH_CALLBACK_URL ?? `${webUrl.replace(/\/$/, "")}/api/auth/callback`,
