@@ -68,6 +68,23 @@ with compose.
 
 5. Start or roll the services in this order: `api`, `worker`, `gateway`, `mcp`,
    then optional `web`.
+
+   Repository-write tracking uses an explicit two-phase promotion during the
+   upgrade that introduces durable write leases:
+
+   1. Deploy the new API and runner everywhere with
+      `FACILITY_REPOSITORY_WRITE_TRACKING_PROMOTION=0` (the default). New
+      runners negotiate version `0` and use the legacy token wire format; those
+      runs remain permanently ineligible for governed retry.
+   2. After every old API replica is drained, set
+      `FACILITY_REPOSITORY_WRITE_TRACKING_PROMOTION=1` on every API replica.
+      New handshakes then negotiate version `1`, and every write token is
+      backed by a durable repository-write lease.
+
+   Once phase 2 has created any version-1 run, do not roll back to an old API
+   binary until all version-1 runs are terminal and drained. The promotion flag
+   controls only new `/hello` negotiation: a new API always enforces an existing
+   version-1 marker even when the flag is off.
 6. Bootstrap the first owner and issue an API key. On an empty installation,
    run `facility instance bootstrap`, then open `https://<web-host>/api/auth/login`; the configured GitHub user
    signs into the organization already created by bootstrap. With the optional web

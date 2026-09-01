@@ -29,7 +29,7 @@ import {
   seed,
   userIdentities,
 } from "@facility/db";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
@@ -3879,7 +3879,10 @@ describe("github platform lane", async () => {
     const calls: Parameters<GithubInstallationTokenFactory>[0][] = [];
     app.githubInstallationTokenFactory = async (input) => {
       calls.push(input);
-      return `issued-token-${calls.length}`;
+      return {
+        token: `issued-token-${calls.length}`,
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      };
     };
     const request = (payload?: Record<string, unknown>) =>
       app.inject({
@@ -3895,11 +3898,11 @@ describe("github platform lane", async () => {
       const workflow = await request({ workflowWrite: true });
 
       expect(absent.statusCode, JSON.stringify(absent.json())).toBe(200);
-      expect(absent.json()).toEqual({ token: "issued-token-1" });
+      expect(absent.json()).toEqual({ token: "issued-token-1", authorizedBranch: null });
       expect(explicitFalse.statusCode).toBe(200);
-      expect(explicitFalse.json()).toEqual({ token: "issued-token-2" });
+      expect(explicitFalse.json()).toEqual({ token: "issued-token-2", authorizedBranch: null });
       expect(workflow.statusCode).toBe(200);
-      expect(workflow.json()).toEqual({ token: "issued-token-3" });
+      expect(workflow.json()).toEqual({ token: "issued-token-3", authorizedBranch: null });
       expect(calls).toEqual([
         {
           installationId: installation.installationId,
@@ -3940,11 +3943,33 @@ describe("github platform lane", async () => {
             eq(auditEvents.action, "run.push_token_issued"),
             sql`${auditEvents.target}->>'id' = ${run.id}`,
           ),
-        );
+        )
+        .orderBy(asc(auditEvents.createdAt), asc(auditEvents.id));
       expect(audit.map((event) => event.payload)).toEqual([
-        { repoId: repo.id, permissions: ["contents"] },
-        { repoId: repo.id, permissions: ["contents"] },
-        { repoId: repo.id, permissions: ["contents", "workflows"] },
+        expect.objectContaining({
+          repoId: repo.id,
+          provider: "github_installation",
+          permissions: ["contents"],
+          repositoryWriteTrackingVersion: 0,
+          issuedAt: expect.any(String),
+          expiresAt: "2099-01-01T00:00:00.000Z",
+        }),
+        expect.objectContaining({
+          repoId: repo.id,
+          provider: "github_installation",
+          permissions: ["contents"],
+          repositoryWriteTrackingVersion: 0,
+          issuedAt: expect.any(String),
+          expiresAt: "2099-01-01T00:00:00.000Z",
+        }),
+        expect.objectContaining({
+          repoId: repo.id,
+          provider: "github_installation",
+          permissions: ["contents", "workflows"],
+          repositoryWriteTrackingVersion: 0,
+          issuedAt: expect.any(String),
+          expiresAt: "2099-01-01T00:00:00.000Z",
+        }),
       ]);
       expect(JSON.stringify(audit)).not.toContain("issued-token");
       expect(JSON.stringify(audit)).not.toContain("foreign/repository");
@@ -3958,7 +3983,7 @@ describe("github platform lane", async () => {
     const factoryCalls: Parameters<GithubInstallationTokenFactory>[0][] = [];
     app.githubInstallationTokenFactory = async (input) => {
       factoryCalls.push(input);
-      return "must-not-be-issued";
+      return { token: "must-not-be-issued", expiresAt: "2099-01-01T00:00:00.000Z" };
     };
 
     try {
@@ -4071,7 +4096,10 @@ describe("github platform lane", async () => {
     const factoryCalls: Parameters<GithubInstallationTokenFactory>[0][] = [];
     app.githubInstallationTokenFactory = async (input) => {
       factoryCalls.push(input);
-      return "issued-for-case-equivalent-owner";
+      return {
+        token: "issued-for-case-equivalent-owner",
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      };
     };
 
     try {
@@ -4083,7 +4111,10 @@ describe("github platform lane", async () => {
       });
 
       expect(response.statusCode, JSON.stringify(response.json())).toBe(200);
-      expect(response.json()).toEqual({ token: "issued-for-case-equivalent-owner" });
+      expect(response.json()).toEqual({
+        token: "issued-for-case-equivalent-owner",
+        authorizedBranch: null,
+      });
       expect(factoryCalls).toEqual([
         {
           installationId: installation.installationId,
@@ -4128,9 +4159,12 @@ describe("github platform lane", async () => {
         payload: { workflowWrite: true },
       });
 
-      expect(response.statusCode).toBe(500);
+      expect(response.statusCode).toBe(503);
       expect(response.json()).toEqual({
-        error: { code: "internal_error", message: "Internal server error" },
+        error: {
+          code: "repository_write_credential_indeterminate",
+          message: "Repository write credential issuance is indeterminate",
+        },
       });
       expect(calls).toHaveLength(1);
       expect(calls[0]?.permissions).toEqual({ contents: "write", workflows: "write" });

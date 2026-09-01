@@ -86,6 +86,7 @@ import {
   createPreviewRecord,
   previewAccessUrl,
 } from "../previews.js";
+import { acquireExclusiveRunTransitionTransactionLease } from "../run-api-key-lease.js";
 import type { AppConfig } from "../types.js";
 import { raisePlatformIssue, resolvePlatformIssue } from "../watchtower/issues.js";
 import { sandboxCachePartition, sandboxNamespace } from "./cache.js";
@@ -108,6 +109,8 @@ type RunRow = typeof runs.$inferSelect;
 type FinishRunDeps = {
   config?: AppConfig;
   githubClientFactory?: GithubClientFactory;
+  /** API-originated terminal claims use the dedicated transition pool. */
+  transitionDb?: ReturnType<typeof createDb>["db"];
   enqueue?: (queue: string, data: Record<string, unknown>) => Promise<unknown>;
   /** Test seam for proving terminal run + proposal commit atomicity. */
   afterArchitectPlanOutboxWrite?: () => Promise<void> | void;
@@ -514,63 +517,95 @@ export async function finishRun(
       error = "security_report_invalid";
     }
   }
-  const deliveryError = status === "succeeded" ? platformDeliveryFailure(run, input.git) : null;
-  if (deliveryError) {
-    status = "failed";
-    error = deliveryError;
-  }
-  if (status === "succeeded" && (await runUsesHarness(db, run))) {
-    const checkpoint = await validateProjectKb(db, run.orgId, run.projectId);
-    if (!checkpoint.ok) {
-      status = "failed";
-      error = `kb_checkpoint_failed:${checkpoint.errors.map((e) => e.code).join(",")}`;
-    }
-  }
-  const persistedGh =
-    input.git?.branch && isBuilderMode(run.mode)
-      ? {
-          ...objectOrEmpty(run.gh),
-          branch: input.git.branch,
-          ...(input.git.headSha ? { headSha: input.git.headSha } : {}),
-        }
-      : run.gh;
-  let deliveryPlan: Awaited<ReturnType<typeof prepareRunDelivery>> | null = null;
-  let deliveryPreparationError: string | null = null;
-  if (status === "succeeded" && input.git?.branch && isBuilderMode(run.mode)) {
-    try {
-      deliveryPlan = await prepareRunDelivery(db, { ...run, gh: persistedGh }, input.git);
-    } catch (prepareError) {
-      deliveryPreparationError = errorMessage(prepareError);
-      status = "failed";
-      error = `delivery_repo_unresolvable:${deliveryPreparationError}`;
-    }
-  }
-  const sandbox = readSandbox(run.sandbox);
-  const aggregate = await gatewayAggregate(db, run.id);
-  // A delivery receipt names the published range. Runs without a delivery
-  // still expose the prepared workspace base they actually inspected.
-  const receiptBaseSha = input.git?.baseSha ?? run.workspaceBaseSha;
-  let receipt = await canonicalRunReceipt(
-    db,
-    run,
-    input.receipt,
-    aggregate,
-    status,
-    receiptBaseSha,
-  );
-  const claim = await db.transaction(async (transaction) => {
+  const claim = await (deps?.transitionDb ?? db).transaction(async (transaction) => {
     const tx = transaction as unknown as ReturnType<typeof createDb>["db"];
+    await acquireExclusiveRunTransitionTransactionLease(tx, run.id);
+    // The shared request lease excludes every runner/platform mutation while
+    // we re-read and aggregate terminal evidence. Receipt/KB decisions must
+    // describe this exact immutable parent, not a pre-lock snapshot.
+    const current = (
+      await tx
+        .select()
+        .from(runs)
+        .where(
+          and(eq(runs.id, run.id), eq(runs.orgId, run.orgId), eq(runs.projectId, run.projectId)),
+        )
+        .limit(1)
+    )[0];
+    if (!current || terminalStatus(current.status)) return null;
+    const authenticatedRunnerHash = readSandbox(run.sandbox).runnerTokenHash;
+    if (
+      authenticatedRunnerHash &&
+      readSandbox(current.sandbox).runnerTokenHash !== authenticatedRunnerHash
+    ) {
+      throw new ApiError(
+        409,
+        "runner_callback_inactive",
+        "Runner credential changed before terminal transition",
+      );
+    }
+
+    let claimedStatus = status;
+    let claimedError = error;
+    const deliveryError =
+      claimedStatus === "succeeded" ? platformDeliveryFailure(current, input.git) : null;
+    if (deliveryError) {
+      claimedStatus = "failed";
+      claimedError = deliveryError;
+    }
+    if (claimedStatus === "succeeded" && (await runUsesHarness(tx, current))) {
+      const checkpoint = await validateProjectKb(tx, current.orgId, current.projectId);
+      if (!checkpoint.ok) {
+        claimedStatus = "failed";
+        claimedError = `kb_checkpoint_failed:${checkpoint.errors.map((e) => e.code).join(",")}`;
+      }
+    }
+    const persistedGh =
+      input.git?.branch && isBuilderMode(current.mode)
+        ? {
+            ...objectOrEmpty(current.gh),
+            branch: input.git.branch,
+            ...(input.git.headSha ? { headSha: input.git.headSha } : {}),
+          }
+        : current.gh;
+    let deliveryPlan: Awaited<ReturnType<typeof prepareRunDelivery>> | null = null;
+    let deliveryPreparationError: string | null = null;
+    if (claimedStatus === "succeeded" && input.git?.branch && isBuilderMode(current.mode)) {
+      try {
+        deliveryPlan = await prepareRunDelivery(tx, { ...current, gh: persistedGh }, input.git);
+      } catch (prepareError) {
+        deliveryPreparationError = errorMessage(prepareError);
+        claimedStatus = "failed";
+        claimedError = `delivery_repo_unresolvable:${deliveryPreparationError}`;
+      }
+    }
+    const aggregate = await gatewayAggregate(tx, current.id);
+    // A delivery receipt names the published range. Runs without a delivery
+    // still expose the prepared workspace base they actually inspected.
+    const receiptBaseSha = input.git?.baseSha ?? current.workspaceBaseSha;
+    const receipt = await canonicalRunReceipt(
+      tx,
+      current,
+      input.receipt,
+      aggregate,
+      claimedStatus,
+      receiptBaseSha,
+    );
     const terminal = (
       await tx
         .update(runs)
         .set({
-          status,
+          status: claimedStatus,
           receipt,
-          error,
+          error: claimedError,
           gh: persistedGh,
           engineSessionId: input.engineSessionId,
           endedAt: new Date(),
-          sandbox: { ...sandbox, finishedAt: new Date().toISOString() },
+          // Provider launch and /hello own other sandbox fields. Merge only
+          // the terminal marker so a concurrently attached ref cannot be lost.
+          sandbox: sql`${runs.sandbox} || ${JSON.stringify({
+            finishedAt: new Date().toISOString(),
+          })}::jsonb`,
           updatedAt: new Date(),
         })
         // Terminal status, durable PR delivery intent, and the Architect Gate
@@ -581,18 +616,36 @@ export async function finishRun(
         .returning()
     )[0];
     if (!terminal) return null;
-    if (status === "succeeded" && deliveryPlan) {
+    // Revoke both gateway and platform authority in the same commit that makes
+    // the run terminal. Provider destruction is deliberately post-commit.
+    await revokeRunKeys(tx, readSandbox(terminal.sandbox));
+    if (claimedStatus === "succeeded" && deliveryPlan) {
       await tx.insert(runDeliveries).values(deliveryPlan);
     }
     const architectProposal =
-      status === "succeeded" && isArchitectMode(terminal.mode)
+      claimedStatus === "succeeded" && isArchitectMode(terminal.mode)
         ? await ensureArchitectPlanAcceptance(tx, terminal, receipt)
         : undefined;
     if (architectProposal) await deps?.afterArchitectPlanOutboxWrite?.();
-    return { run: terminal, architectProposalId: architectProposal?.id };
+    return {
+      run: terminal,
+      architectProposalId: architectProposal?.id,
+      status: claimedStatus,
+      error: claimedError,
+      receipt,
+      receiptBaseSha,
+      aggregate,
+      deliveryPlan,
+      deliveryPreparationError,
+    };
   });
   if (!claim) return run;
   const claimed = claim.run;
+  status = claim.status;
+  error = claim.error;
+  let { receipt } = claim;
+  const { aggregate, deliveryPlan, deliveryPreparationError, receiptBaseSha } = claim;
+  const sandbox = readSandbox(claimed.sandbox);
   if (sandbox.driver && sandbox.ref) {
     const driver = await sandboxDriver(sandbox.driver);
     const destroyed = await driver
@@ -601,7 +654,6 @@ export async function finishRun(
       .catch(() => false);
     if (destroyed) await markSandboxDestroyed(db, run.id);
   }
-  await revokeRunKeys(db, sandbox);
   if (status === "succeeded" && deliveryPlan) {
     await deps?.enqueue?.("deliveries.deliver", { runId: run.id }).catch(() => undefined);
   } else if (deliveryPreparationError) {
@@ -670,16 +722,28 @@ export async function finishRun(
       error = `security_issue_sync_failed:${message}`;
       receipt = await canonicalRunReceipt(
         db,
-        run,
+        claimed,
         input.receipt,
         aggregate,
         status,
         receiptBaseSha,
       );
-      await db
-        .update(runs)
-        .set({ status, receipt, error, updatedAt: new Date() })
-        .where(and(eq(runs.orgId, run.orgId), eq(runs.id, run.id)));
+      await db.transaction(async (transaction) => {
+        const tx = transaction as unknown as ReturnType<typeof createDb>["db"];
+        await acquireExclusiveRunTransitionTransactionLease(tx, run.id);
+        const [downgraded] = await tx
+          .update(runs)
+          .set({ status, receipt, error, updatedAt: new Date() })
+          .where(and(eq(runs.orgId, run.orgId), eq(runs.id, run.id), eq(runs.status, "succeeded")))
+          .returning({ id: runs.id });
+        if (!downgraded) {
+          throw new ApiError(
+            409,
+            "run_terminal_state_changed",
+            "Security synchronization could not update the claimed terminal state",
+          );
+        }
+      });
       await appendRunEvents(db, run.orgId, run.id, [
         { type: "artifact_error", data: { kind: "security_issue_sync_failed", error: message } },
       ]);
@@ -2923,24 +2987,30 @@ export async function failRun(
   runId: string,
   message: string,
   kind: string,
+  transitionDb: ReturnType<typeof createDb>["db"] = db,
 ) {
   // Claim the failure atomically: only a non-terminal run transitions, so a
   // concurrent finish/cancel/fail cannot be clobbered and cleanup runs once.
-  const [failed] = await db
-    .update(runs)
-    .set({ status: "failed", error: message, endedAt: new Date(), updatedAt: new Date() })
-    .where(
-      and(
-        eq(runs.orgId, orgId),
-        eq(runs.id, runId),
-        notInArray(runs.status, [...TERMINAL_RUN_STATUSES]),
-      ),
-    )
-    .returning({ projectId: runs.projectId, sandbox: runs.sandbox, trigger: runs.trigger });
+  const failed = await transitionDb.transaction(async (transaction) => {
+    const tx = transaction as unknown as ReturnType<typeof createDb>["db"];
+    await acquireExclusiveRunTransitionTransactionLease(tx, runId);
+    const failed = (
+      await tx
+        .update(runs)
+        .set({ status: "failed", error: message, endedAt: new Date(), updatedAt: new Date() })
+        .where(
+          and(
+            eq(runs.orgId, orgId),
+            eq(runs.id, runId),
+            notInArray(runs.status, [...TERMINAL_RUN_STATUSES]),
+          ),
+        )
+        .returning({ projectId: runs.projectId, sandbox: runs.sandbox, trigger: runs.trigger })
+    )[0];
+    if (failed) await revokeRunKeys(tx, readSandbox(failed.sandbox));
+    return failed;
+  });
   if (!failed) return; // already terminal — another path handled it.
-  // Reclaim the run's credentials + sandbox so a failed run can't keep calling
-  // the gateway or the platform API.
-  await revokeRunKeys(db, readSandbox(failed.sandbox));
   // A conversation turn holds its thread's "running" lock (new messages are
   // rejected while running). If the run failed BEFORE finishRun could release it
   // (bad image, provisioning error), the thread would deadlock forever — so free

@@ -17,10 +17,12 @@ import { z } from "zod";
 import { withBuilderPlanPreflight } from "../../builder-plan-policy.js";
 import { readTranscriptObject } from "../../envelopes.js";
 import { ApiError, notFound } from "../../errors.js";
-import { cancelRun } from "../../sandbox/orchestrator.js";
+import { acquireExclusiveRunTransitionTransactionLease } from "../../run-api-key-lease.js";
+import { cancelRun, revokeRunKeys } from "../../sandbox/orchestrator.js";
 import {
   appendRunEvents,
   notifyRunEvent,
+  readSandbox,
   TERMINAL_RUN_STATUSES,
   terminalStatus,
 } from "../../sandbox/state.js";
@@ -500,7 +502,11 @@ export async function registerRunsRoutes(app: FastifyInstance, context: V1RouteC
   app.post(
     "/v1/runs/:runId/cancel",
     {
-      config: { permission: "runs:write", auditAction: "run.canceled" },
+      config: {
+        permission: "runs:write",
+        auditAction: "run.canceled",
+        runLifecycle: true,
+      },
       schema: { params: IdParams, response: { 200: RunSchema } },
     },
     async (request) => {
@@ -510,7 +516,8 @@ export async function registerRunsRoutes(app: FastifyInstance, context: V1RouteC
       // Only cancel a non-terminal run — never overwrite a run that already
       // succeeded/failed/canceled. If the guard matches nothing the run is
       // already terminal, so return it unchanged (idempotent).
-      const { row, event } = await db.transaction(async (tx) => {
+      const { row, event } = await app.runTransitionDb.transaction(async (tx) => {
+        await acquireExclusiveRunTransitionTransactionLease(tx, runId);
         // Serialize the terminal transition with event-sequence allocation so
         // every successful cancellation has exactly one durable result event.
         await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${runId}))`);
@@ -544,6 +551,7 @@ export async function registerRunsRoutes(app: FastifyInstance, context: V1RouteC
             })
             .returning()
         )[0];
+        await revokeRunKeys(tx as unknown as typeof db, readSandbox(row.sandbox));
         return { row, event };
       });
       if (!row) return redactRunSecrets(existing);
@@ -786,7 +794,7 @@ export async function registerRunsRoutes(app: FastifyInstance, context: V1RouteC
   app.post(
     "/v1/runs/:runId/resume",
     {
-      config: { permission: "runs:trigger" },
+      config: { permission: "runs:trigger", runLifecycle: true },
       schema: {
         params: IdParams,
         body: z.object({ message: z.string().optional() }).nullable().default({}),
