@@ -1908,8 +1908,10 @@ export async function shipGitChanges(
         runId,
       );
     }
+    const workflowWrite = githubWorkflowWriteRequired(changes);
     const { token } = await api<{ token: string }>(`/internal/runs/${runId}/push-token`, {
       method: "POST",
+      body: JSON.stringify({ workflowWrite }),
     });
     secretsToRedact.add(token);
     const published = repairRepositoryMode(mode)
@@ -1958,6 +1960,10 @@ export async function shipGitChanges(
 type GithubFileChange =
   | { kind: "addition"; path: string; contents: string }
   | { kind: "deletion"; path: string };
+
+export function githubWorkflowWriteRequired(changes: readonly { path: string }[]) {
+  return changes.some(({ path }) => path.startsWith(".github/workflows/"));
+}
 
 const SEMANTIC_BRANCH =
   /^(feature|fix|chore|ci|docs|refactor|perf|test|build|revert)\/[a-z0-9][a-z0-9._/-]*$/;

@@ -30,6 +30,7 @@ import {
   engineResultError,
   exitCode,
   githubRequest,
+  githubWorkflowWriteRequired,
   gitOutput,
   handleControlMessage,
   parseGitNameStatus,
@@ -927,6 +928,42 @@ describe("workspace preparation", () => {
     ]);
     expect(semanticDeliveryBranch("feature/2-subtract", "main")).toBe("feature/2-subtract");
     expect(() => semanticDeliveryBranch("main", "main")).toThrow("branch_not_semantic");
+  });
+
+  describe("GitHub workflow publication capability", () => {
+    it.each([
+      ["source file", [{ kind: "addition", path: "src/index.ts" }], false],
+      ["workflow addition", [{ kind: "addition", path: ".github/workflows/ci.yml" }], true],
+      [
+        "workflow modification",
+        [{ kind: "addition", path: ".github/workflows/release.yml" }],
+        true,
+      ],
+      ["workflow deletion", [{ kind: "deletion", path: ".github/workflows/old.yml" }], true],
+      [
+        "nested workflow path",
+        [{ kind: "addition", path: ".github/workflows/generated/security.yml" }],
+        true,
+      ],
+      [
+        "workflow-like directory",
+        [{ kind: "addition", path: ".github/workflows-not/ci.yml" }],
+        false,
+      ],
+      ["workflow-like file", [{ kind: "addition", path: ".github/workflows.yml" }], false],
+      ["case variant", [{ kind: "addition", path: ".github/Workflows/ci.yml" }], false],
+    ] as const)("classifies a %s", (_name, changes, expected) => {
+      expect(githubWorkflowWriteRequired(changes)).toBe(expected);
+    });
+
+    it("finds a workflow in a large mixed final change set", () => {
+      const changes = Array.from({ length: 10_000 }, (_, index) => ({
+        path: `src/generated/${index}.ts`,
+      }));
+      changes.push({ path: ".github/workflows/preview.yml" });
+
+      expect(githubWorkflowWriteRequired(changes)).toBe(true);
+    });
   });
 
   it("accepts minimal agent-owned metadata for an existing PR update", async () => {

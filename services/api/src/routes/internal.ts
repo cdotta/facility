@@ -25,6 +25,10 @@ import type { AppConfig } from "../types.js";
 
 const Params = z.object({ runId: z.string() });
 const GitCommitSha = z.string().regex(/^[0-9a-f]{40}$/i);
+// Fastify represents a POST with no payload as null. Accept that wire shape so
+// runners deployed before the capability body continue to receive the
+// contents-only token; populated bodies remain strict and closed.
+const PushTokenRequest = z.object({ workflowWrite: z.boolean().optional() }).strict().nullish();
 const TRANSCRIPT_MAX_BYTES = 50 * 1024 * 1024;
 const SESSION_STATE_MAX_BYTES = 200 * 1024 * 1024;
 const EventBatch = z.array(
@@ -311,6 +315,7 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
       preHandler: authenticate,
       schema: {
         params: Params,
+        body: PushTokenRequest,
         response: { 200: z.object({ token: z.string() }) },
       },
     },
@@ -326,7 +331,14 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
         await db
           .select()
           .from(githubInstallations)
-          .where(eq(githubInstallations.id, repoRef.installationId))
+          .where(
+            and(
+              eq(githubInstallations.id, repoRef.installationId),
+              eq(githubInstallations.orgId, run.orgId),
+              sql`lower(${githubInstallations.accountLogin}) = lower(${repoRef.owner})`,
+              isNull(githubInstallations.suspendedAt),
+            ),
+          )
           .limit(1)
       )[0];
       if (!installation) {
@@ -334,11 +346,16 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
       }
       const tokenFactory =
         app.githubInstallationTokenFactory ?? createGithubInstallationTokenFactory(config);
+      const workflowWrite =
+        (request.body as { workflowWrite?: boolean } | null | undefined)?.workflowWrite ?? false;
+      const permissions: Record<string, string> = workflowWrite
+        ? { contents: "write", workflows: "write" }
+        : { contents: "write" };
       const token = await tokenFactory({
         installationId: installation.installationId,
         owner: repoRef.owner,
         repo: repoRef.name,
-        permissions: { contents: "write" },
+        permissions,
       });
       await insertAuditEvent(db, {
         orgId: run.orgId,
@@ -346,7 +363,7 @@ export async function registerInternalRoutes(app: FastifyInstance, config: AppCo
         actor: { type: "agent", id: run.id },
         action: "run.push_token_issued",
         target: { type: "run", id: run.id },
-        payload: { repoId: repoRef.id },
+        payload: { repoId: repoRef.id, permissions: Object.keys(permissions) },
       });
       return { token };
     },
