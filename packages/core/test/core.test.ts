@@ -113,6 +113,7 @@ describe("ids", () => {
   it("creates prefixed uuidv7 ids", () => {
     expect(newId("proj")).toMatch(/^proj_[0-9a-f]{32}$/);
     expect(newId("pvh")).toMatch(/^pvh_[0-9a-f]{32}$/);
+    expect(newId("rwl")).toMatch(/^rwl_[0-9a-f]{32}$/);
   });
 });
 
