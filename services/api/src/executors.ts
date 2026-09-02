@@ -41,6 +41,7 @@ import {
 } from "./builder-plan-freshness.js";
 import {
   architectRunIdentityValid,
+  assertGenericRunResumeAllowed,
   builderPlanDenialCode,
   builderPlanRequired,
   lockBuilderPlanPolicy,
@@ -627,6 +628,7 @@ export async function loadPlanBuilderRun(db: Db, proposal: typeof proposals.$inf
           eq(runs.orgId, proposal.orgId),
           eq(runs.projectId, proposal.projectId ?? ""),
           inArray(runs.mode, ["builder", "codex-builder"]),
+          isNull(runs.retryOfRunId),
           sql`${runs.trigger} @> ${JSON.stringify({
             source: "plan_acceptance",
             proposalId: proposal.id,
@@ -648,6 +650,7 @@ async function loadArchitectBuilderRun(db: Db, proposal: typeof proposals.$infer
           eq(runs.orgId, proposal.orgId),
           eq(runs.projectId, proposal.projectId ?? ""),
           inArray(runs.mode, ["builder", "codex-builder"]),
+          isNull(runs.retryOfRunId),
           sql`${runs.trigger} @> ${JSON.stringify({
             source: "plan_acceptance",
             architectRunId: proposal.runId,
@@ -1032,6 +1035,7 @@ async function executeKnownMcpTool(
         .limit(1)
     )[0];
     if (!parent) throw new Error("run_not_found");
+    await assertGenericRunResumeAllowed(db, parent);
     if (!TERMINAL_RUN_STATUSES.includes(parent.status as (typeof TERMINAL_RUN_STATUSES)[number])) {
       throw new Error("run_not_terminal");
     }
@@ -1176,6 +1180,22 @@ async function executeKnownMcpTool(
             .returning()
         )[0];
         if (!conversation) throw new Error("conversation_turn_in_flight");
+        if (conversation.engineSessionId && conversation.lastRunId) {
+          const parent = (
+            await tx
+              .select()
+              .from(runs)
+              .where(
+                and(
+                  eq(runs.orgId, conversation.orgId),
+                  eq(runs.projectId, conversation.projectId),
+                  eq(runs.id, conversation.lastRunId),
+                ),
+              )
+              .limit(1)
+          )[0];
+          if (parent) await assertGenericRunResumeAllowed(tx, parent);
+        }
         const rows = await tx
           .select({ max: sql<number>`coalesce(max(${conversationMessages.seq}), 0)` })
           .from(conversationMessages)

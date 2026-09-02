@@ -47,6 +47,7 @@ import {
 } from "../builder-plan-freshness.js";
 import {
   assertBuilderPlanDispatch,
+  assertGenericRunResumeAllowed,
   builderPlanDenialCode,
   builderPlanRequired,
   recordBuilderPlanDenial,
@@ -80,6 +81,13 @@ import {
   sanitizeSecurityReport,
   syncSecurityFindings,
 } from "../github/security-findings.js";
+import {
+  assertGovernedRetryDispatchState,
+  type GovernedRetryExternalOptions,
+  governedRetryDenial,
+  recordGovernedRetryDenial,
+  validateGovernedRetryForDispatch,
+} from "../governed-builder-retry.js";
 import { harnessFragmentForBundle, validateProjectKb } from "../harness.js";
 import {
   assertPreviewProvisioningAvailable,
@@ -119,6 +127,7 @@ type DispatchRunDeps = {
   sandboxDriver?: (name: SandboxDriverName) => Promise<SandboxDriver>;
   githubFactory?: GithubClientFactory;
   githubClient?: BuilderPlanFreshnessOptions["githubClient"];
+  repositoryWriteClient?: GovernedRetryExternalOptions["repositoryWriteClient"];
 };
 
 type ArchitectPlanPublicationJob = {
@@ -178,21 +187,41 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
   let launchedSandbox: { driver: SandboxDriver; ref: string } | undefined;
   let run: RunRow | undefined;
   let freshnessFailureSource: "worker_initial_freshness" | "worker_claimed_freshness" | null = null;
+  let governedRetryFailureSource:
+    | "worker_initial_governed_retry"
+    | "worker_claimed_governed_retry"
+    | null = null;
   try {
     run = await loadRun(db, job.orgId, job.runId);
     if (run?.status !== "queued") return;
-    const requiredBuilderPlan =
-      isBuilderMode(run.mode) && (await builderPlanRequired(db, run.orgId, run.projectId));
-    const requiredPlanFreshness =
-      requiredBuilderPlan && objectOrEmpty(run.trigger).source === "plan_acceptance";
-    freshnessFailureSource = requiredPlanFreshness ? "worker_initial_freshness" : null;
-    const initialFreshness = requiredPlanFreshness
-      ? await resolveBuilderPlanFreshnessForRun(db, run, {
+    governedRetryFailureSource = run.retryOfRunId ? "worker_initial_governed_retry" : null;
+    freshnessFailureSource = run.retryOfRunId ? "worker_initial_freshness" : null;
+    const initialGovernedRetry = run.retryOfRunId
+      ? await validateGovernedRetryForDispatch(db, run, {
           config,
           githubFactory: deps.githubFactory,
           githubClient: deps.githubClient,
+          repositoryWriteClient: deps.repositoryWriteClient,
         })
       : undefined;
+    const planRoot = initialGovernedRetry?.lineage.root ?? run;
+    const requiredBuilderPlan =
+      isBuilderMode(run.mode) && (await builderPlanRequired(db, run.orgId, run.projectId));
+    const requiredPlanFreshness =
+      requiredBuilderPlan && objectOrEmpty(planRoot.trigger).source === "plan_acceptance";
+    freshnessFailureSource = requiredPlanFreshness ? "worker_initial_freshness" : null;
+    const initialFreshness = initialGovernedRetry
+      ? initialGovernedRetry.evidence.freshness
+      : requiredPlanFreshness
+        ? await resolveBuilderPlanFreshnessForRun(db, planRoot, {
+            config,
+            githubFactory: deps.githubFactory,
+            githubClient: deps.githubClient,
+          })
+        : undefined;
+    // assertBuilderPlanDispatch persists its own denial. Keep this source only
+    // around the external freshness lookup so the outer catch cannot duplicate
+    // that durable audit.
     freshnessFailureSource = null;
     await assertBuilderPlanDispatch(db, {
       orgId: run.orgId,
@@ -202,6 +231,7 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
       trigger: run.trigger,
       gh: run.gh,
       runId: run.id,
+      acceptanceRunId: initialGovernedRetry?.lineage.root.id,
       actor: { type: "system", id: "runs.dispatch" },
       source: "worker_dispatch",
       freshnessEvidence: initialFreshness,
@@ -220,14 +250,33 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
     // claiming first prevents another worker racing ahead while this final
     // check fails. The outer failure boundary marks the row failed before any
     // credential or sandbox side effect is created.
-    freshnessFailureSource = requiredPlanFreshness ? "worker_claimed_freshness" : null;
-    const claimedFreshness = requiredPlanFreshness
-      ? await resolveBuilderPlanFreshnessForRun(db, run, {
+    const claimedCurrentRun = await loadRun(db, run.orgId, run.id);
+    if (!claimedCurrentRun) return;
+    governedRetryFailureSource = claimedCurrentRun.retryOfRunId
+      ? "worker_claimed_governed_retry"
+      : governedRetryFailureSource;
+    freshnessFailureSource = claimedCurrentRun.retryOfRunId
+      ? "worker_claimed_freshness"
+      : requiredPlanFreshness
+        ? "worker_claimed_freshness"
+        : null;
+    const claimedGovernedRetry = claimedCurrentRun.retryOfRunId
+      ? await validateGovernedRetryForDispatch(db, claimedCurrentRun, {
           config,
           githubFactory: deps.githubFactory,
           githubClient: deps.githubClient,
+          repositoryWriteClient: deps.repositoryWriteClient,
         })
       : undefined;
+    const claimedFreshness = claimedGovernedRetry
+      ? claimedGovernedRetry.evidence.freshness
+      : requiredPlanFreshness
+        ? await resolveBuilderPlanFreshnessForRun(db, planRoot, {
+            config,
+            githubFactory: deps.githubFactory,
+            githubClient: deps.githubClient,
+          })
+        : undefined;
     freshnessFailureSource = null;
     const claimedRunScope = { orgId: run.orgId, runId: run.id };
     const dispatchSnapshot = await withBuilderPlanPreflight(
@@ -240,6 +289,7 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
         trigger: run.trigger,
         gh: run.gh,
         runId: run.id,
+        acceptanceRunId: claimedGovernedRetry?.lineage.root.id,
         actor: { type: "system", id: "runs.dispatch" },
         source: "worker_claimed_dispatch",
         freshnessEvidence: claimedFreshness,
@@ -247,6 +297,9 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
       async (tx, admission) => {
         let claimedRun = await loadRun(tx, claimedRunScope.orgId, claimedRunScope.runId);
         if (claimedRun?.status !== "provisioning") return null;
+        if (claimedGovernedRetry) {
+          await assertGovernedRetryDispatchState(tx, claimedRun, claimedGovernedRetry);
+        }
         if (claimedRun.mode !== admission.mode) {
           const sealed = (
             await tx
@@ -429,6 +482,7 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
     await updateGithubRunProgress(db, run.id, "provisioning", { config }).catch(() => undefined);
   } catch (error) {
     const builderPlanCode = error instanceof ApiError ? builderPlanDenialCode(error.code) : null;
+    const governedRetry = governedRetryDenial(error);
     if (builderPlanCode && freshnessFailureSource && run) {
       await recordBuilderPlanDenial(
         db,
@@ -448,12 +502,28 @@ export async function dispatchRun(config: AppConfig, job: DispatchJob, deps: Dis
           "freshness_resolution_failed",
       ).catch(() => undefined);
     }
+    if (governedRetry && run) {
+      await recordGovernedRetryDenial(
+        db,
+        run,
+        { type: "system", id: "runs.dispatch" },
+        governedRetryFailureSource ?? "worker_governed_retry",
+        error,
+      ).catch(() => undefined);
+    }
+    const stableFailure = governedRetry
+      ? `${governedRetry.code}:${governedRetry.reason}`
+      : (builderPlanCode ?? errorMessage(error));
     await failRun(
       db,
       job.orgId,
       job.runId,
-      builderPlanCode ?? errorMessage(error),
-      builderPlanCode ? "builder_plan_denied" : "provision_failed",
+      stableFailure,
+      governedRetry
+        ? "governed_retry_denied"
+        : builderPlanCode
+          ? "builder_plan_denied"
+          : "provision_failed",
     ).catch(() => undefined);
     await updateGithubRunProgress(db, job.runId, "failed", { config }).catch(() => undefined);
     // failRun revokes by the persisted sandbox, which on a pre-persist failure
@@ -2761,6 +2831,7 @@ async function resumeForRun(db: ReturnType<typeof createDb>["db"], run: RunRow) 
     if (!parentId) return null;
     const parent = await loadResumeParent(db, run, parentId);
     if (!parent?.engineSessionId) return null;
+    await assertGenericRunResumeAllowed(db, parent);
     return {
       sessionId: parent.engineSessionId,
       sessionStateFrom: parent.id,
@@ -2792,6 +2863,7 @@ async function resumeForRun(db: ReturnType<typeof createDb>["db"], run: RunRow) 
     if (!conversation?.engineSessionId || !parentId) return null;
     const parent = await loadResumeParent(db, run, parentId);
     if (!parent) return null;
+    await assertGenericRunResumeAllowed(db, parent);
     return {
       sessionId: conversation.engineSessionId,
       sessionStateFrom: parent.id,
@@ -3240,6 +3312,44 @@ async function canonicalRunReceipt(
 }
 
 async function previousReceiptDigest(db: ReturnType<typeof createDb>["db"], run: RunRow) {
+  if (run.retryOfRunId) {
+    const seen = new Set<string>([run.id]);
+    let ancestorId: string | null = run.retryOfRunId;
+    for (let depth = 0; ancestorId && depth < 100; depth += 1) {
+      if (seen.has(ancestorId)) return null;
+      seen.add(ancestorId);
+      const ancestor:
+        | {
+            id: string;
+            retryOfRunId: string | null;
+            receipt: unknown;
+          }
+        | undefined = (
+        await db
+          .select({
+            id: runs.id,
+            retryOfRunId: runs.retryOfRunId,
+            receipt: runs.receipt,
+          })
+          .from(runs)
+          .where(
+            and(
+              eq(runs.orgId, run.orgId),
+              eq(runs.projectId, run.projectId),
+              eq(runs.id, ancestorId),
+            ),
+          )
+          .limit(1)
+      )[0];
+      if (!ancestor) return null;
+      const parsed = FacilityReceiptSchema.safeParse(ancestor.receipt);
+      if (parsed.success && verifyFacilityReceipt(parsed.data)) {
+        return parsed.data.integrity?.payload_sha256 ?? null;
+      }
+      ancestorId = ancestor.retryOfRunId;
+    }
+    return null;
+  }
   const candidates = await db
     .select({ receipt: runs.receipt })
     .from(runs)

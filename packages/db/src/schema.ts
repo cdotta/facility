@@ -485,6 +485,10 @@ export const runs = pgTable(
     mode: text("mode").notNull(),
     engine: text("engine").notNull(),
     status: text("status").notNull().default("queued"),
+    // Governed Builder retries are immutable successor rows. Composite scope
+    // and identity enforcement lives in migration 0045 because the parent is
+    // another row in this table.
+    retryOfRunId: text("retry_of_run_id"),
     // Zero write-lease rows are meaningful only after the upgraded runner has
     // explicitly negotiated this protocol during /hello.
     repositoryWriteTrackingVersion: integer("repository_write_tracking_version")
@@ -518,6 +522,14 @@ export const runs = pgTable(
     uniqueIndex("runs_org_ci_repair_key_uidx")
       .on(table.orgId, table.ciRepairKey)
       .where(sql`${table.ciRepairKey} is not null`),
+    uniqueIndex("runs_org_project_id_uidx").on(table.orgId, table.projectId, table.id),
+    uniqueIndex("runs_retry_of_run_uidx")
+      .on(table.orgId, table.projectId, table.retryOfRunId)
+      .where(sql`${table.retryOfRunId} is not null`),
+    check(
+      "runs_retry_not_self_check",
+      sql`${table.retryOfRunId} is null or ${table.retryOfRunId} <> ${table.id}`,
+    ),
     check(
       "runs_repository_write_tracking_version_check",
       sql`${table.repositoryWriteTrackingVersion} in (0, 1)`,
